@@ -10,7 +10,6 @@ class RowColumnAttention(nn.Module):
         self.config = config
         self.row_attention_layer = Qwen3DecoderLayer(config=config, layer_idx=0)
         self.column_attention_layer = Qwen3DecoderLayer(config=config, layer_idx=1)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self._weights_loaded = False
 
     def load_weights_once(self, row_weights: Dict, col_weights: Dict):
@@ -23,7 +22,8 @@ class RowColumnAttention(nn.Module):
         embedded_rows: List[torch.Tensor],
         row_attention_mask: Optional[List[torch.Tensor]] = None,
         column_attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        row_position_embeddings: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        column_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         row_layer_weights: Optional[Dict[str, torch.Tensor]] = None,
         col_layer_weights: Optional[Dict[str, torch.Tensor]] = None
     ):
@@ -38,11 +38,17 @@ class RowColumnAttention(nn.Module):
         if row_attention_mask is None:
             row_attention_mask = [None] * len(embedded_rows)
         
+        if row_position_embeddings is None or column_position_embeddings is None:
+            raise ValueError("row_position_embeddings and column_position_embeddings must be provided")
+        
+        if len(row_position_embeddings) != len(embedded_rows):
+            raise ValueError("The number of row_position_embeddings must be the same as the number of embedded_rows")
+        
         
         processed_rows = []
         container_tokens = []
 
-        for row_embed, row_mask in zip(embedded_rows, row_attention_mask):
+        for row_embed, row_mask, row_position_embedding in zip(embedded_rows, row_attention_mask, row_position_embeddings):
             if row_embed.dim() == 2:
                 row_input = row_embed.unsqueeze(0) # shape -> [1, seq_len, hidden_size]
             else:
@@ -51,17 +57,11 @@ class RowColumnAttention(nn.Module):
             seq_len = row_input.shape[1]
             position_ids = torch.arange(seq_len, device=row_input.device).unsqueeze(0)
 
-            if position_embeddings is None:
-                pos_emb = self.rotary_emb(row_input, position_ids)
-            else:
-                pos_emb = position_embeddings
-            # pos_emb = self.rotary_emb(row_input, position_ids)
-
             row_output = self.row_attention_layer(
                 hidden_states=row_input,
                 attention_mask=row_mask,
                 position_ids=position_ids,
-                position_embeddings=pos_emb
+                position_embeddings=row_position_embedding
             )
 
             row_output = row_output[0] # QwenDecoderLayer returns a tuple, (hidden_state, attention_weight)
@@ -76,17 +76,11 @@ class RowColumnAttention(nn.Module):
         num_rows = container_input.shape[1]
         col_position_ids = torch.arange(num_rows, device=container_input.device).unsqueeze(0)
 
-        if position_embeddings is None:
-            col_pos_emb = self.rotary_emb(container_input, col_position_ids)
-        else:
-            col_pos_emb = position_embeddings
-        # col_pos_emb = self.rotary_emb(container_input, col_position_ids)
-
         col_output = self.column_attention_layer(
             hidden_states=container_input,
             attention_mask=column_attention_mask,
             position_ids=col_position_ids,
-            position_embeddings=col_pos_emb
+            position_embeddings=column_position_embeddings
         )
         col_output = col_output[0]
         final_containers = col_output.squeeze(0) # shape -> [num_rows, hidden_size]
@@ -101,35 +95,37 @@ class RowColumnAttention(nn.Module):
 
 if __name__ == "__main__":
     from transformers import Qwen3Config, Qwen3ForCausalLM
+    # 直接导入Qwen3RotaryEmbedding
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
     import torch
     
     print("🔍 开始测试 RowColumnAttention...")
     
     try:
-        # 1. 从HuggingFace加载Qwen3配置
-        print("📥 从HuggingFace加载Qwen3配置...")
-        # 尝试加载Qwen3相关配置
+        # 1. 加载Qwen3-0.6B模型
+        print("📥 加载Qwen3-0.6B模型...")
         try:
-            # 如果有Qwen3模型，可以直接加载
-            config = Qwen3Config.from_pretrained("Qwen/Qwen3-0.6B")  # 或其他Qwen3模型
-            print("✅ 成功加载Qwen3配置")
-        except:
-            # 如果没有，创建一个典型的Qwen3配置
-            print("⚠️  未找到Qwen3-0.6B，创建默认配置")
+            qwen_model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
+            config = qwen_model.config
+            print("✅ 成功加载Qwen3-0.6B模型和配置")
+            
+            # 直接使用Qwen的rotary_emb
+            qwen_rotary_emb = qwen_model.model.rotary_emb
+            
+        except Exception as e:
+            print(f"⚠️  无法加载Qwen3-0.6B: {e}")
+            print("💡 使用模拟配置")
             config = Qwen3Config(
-                vocab_size=151936,
+                vocab_size=32000,
                 hidden_size=1024,
                 num_attention_heads=16,
                 num_key_value_heads=8,
                 num_hidden_layers=24,
                 intermediate_size=2048,
-                max_position_embeddings=32768
+                max_position_embeddings=32768,
+                rope_theta=10000.0
             )
-        
-        print(f"   - Model: Qwen3")
-        print(f"   - Hidden Size: {config.hidden_size}")
-        print(f"   - Attention Heads: {config.num_attention_heads}")
-        print(f"   - Layers: {config.num_hidden_layers}")
+            qwen_rotary_emb = None
         
         # 2. 创建处理器
         processor = RowColumnAttention(config)
@@ -137,64 +133,83 @@ if __name__ == "__main__":
         
         # 3. 准备测试数据
         embedded_rows = [
-            torch.randn(5, config.hidden_size),  # 行1：5个token
-            torch.randn(3, config.hidden_size),  # 行2：3个token
-            torch.randn(7, config.hidden_size),  # 行3：7个token
+            torch.randn(4, config.hidden_size),  # 行1：4个token
+            torch.randn(3, config.hidden_size),  # 行2：3个token  
+            torch.randn(5, config.hidden_size),  # 行3：5个token
         ]
         
-        print("✅ 测试数据准备完成")
-        print(f"   - 行数: {len(embedded_rows)}")
-        for i, row in enumerate(embedded_rows):
-            print(f"   - 行{i}形状: {row.shape}")
+        device = embedded_rows[0].device
+        print(f"✅ 测试数据准备完成 (设备: {device})")
+        print(f"   - 行长度: {[row.shape[0] for row in embedded_rows]}")
         
-        # 4. 加载真实的Qwen3权重
-        print("📥 加载Qwen3权重...")
+        # 4. 获取权重
+        print("📥 获取权重...")
         try:
-            # 尝试加载真实的Qwen3模型
-            qwen_model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
-            
-            # 获取前两层的权重
-            row_weights = qwen_model.model.layers[0].state_dict()
-            col_weights = qwen_model.model.layers[1].state_dict()
-            
-            print("✅ 成功加载Qwen3权重")
-            print(f"   - 行权重参数数: {len(row_weights)}")
-            print(f"   - 列权重参数数: {len(col_weights)}")
-            
-        except Exception as e:
-            print(f"⚠️  无法加载真实Qwen3权重: {e}")
-            print("💡 使用模拟权重进行测试")
-            # 创建模拟权重
+            if qwen_rotary_emb is not None:
+                row_weights = qwen_model.model.layers[0].state_dict()
+                col_weights = qwen_model.model.layers[1].state_dict()
+                print("✅ 使用真实的Qwen权重")
+            else:
+                raise Exception("No real model")
+        except:
+            print("⚠️  使用随机权重")
             row_weights = {name: torch.randn_like(param) for name, param in processor.row_attention_layer.named_parameters()}
             col_weights = {name: torch.randn_like(param) for name, param in processor.column_attention_layer.named_parameters()}
         
-        # 5. 测试前向传播
-        print("🔄 开始前向传播测试...")
+        # 5. 创建行和列的位置编码
+        print("🔄 创建行和列位置编码...")
         
+        # 为每行创建匹配长度的位置编码
+        row_position_embeddings = []
+        for row in embedded_rows:
+            seq_len = row.shape[0]
+            dummy_input = torch.randn(1, seq_len, config.hidden_size, device=device)
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+            if qwen_rotary_emb is not None:
+                pos_emb = qwen_rotary_emb(dummy_input, position_ids)
+            else:
+                rotary_emb = Qwen3RotaryEmbedding(config=config)
+                pos_emb = rotary_emb(dummy_input, position_ids)
+            row_position_embeddings.append(pos_emb)
+            print(f"   - 行位置编码 (长度{seq_len}): {[p.shape for p in pos_emb]}")
+        
+        # 为列创建位置编码
+        num_rows = len(embedded_rows)
+        col_dummy_input = torch.randn(1, num_rows, config.hidden_size, device=device)
+        col_position_ids = torch.arange(num_rows, device=device).unsqueeze(0)
+        if qwen_rotary_emb is not None:
+            column_position_embeddings = qwen_rotary_emb(col_dummy_input, col_position_ids)
+        else:
+            rotary_emb = Qwen3RotaryEmbedding(config=config)
+            column_position_embeddings = rotary_emb(col_dummy_input, col_position_ids)
+        
+        print(f"   - 列位置编码 (长度{num_rows}): {[p.shape for p in column_position_embeddings]}")
+        
+        # 6. 测试前向传播
+        print("🔄 测试前向传播...")
         try:
             output_rows = processor(
                 embedded_rows=embedded_rows,
                 row_layer_weights=row_weights,
-                col_layer_weights=col_weights
+                col_layer_weights=col_weights,
+                row_position_embeddings=row_position_embeddings,
+                column_position_embeddings=column_position_embeddings
             )
             
-            print("✅ 第一次前向传播成功!")
+            print("✅ 测试成功!")
+            print(f"   - 输入行数: {len(embedded_rows)}")
             print(f"   - 输出行数: {len(output_rows)}")
-            for i, row in enumerate(output_rows):
-                print(f"   - 输出行{i}形状: {row.shape}")
             
-            # 6. 测试第二次调用
-            print("🔄 测试第二次调用...")
-            output_rows_2 = processor(embedded_rows=embedded_rows)
-            print("✅ 第二次调用成功!")
+            for i, (inp, out) in enumerate(zip(embedded_rows, output_rows)):
+                print(f"   - 行{i}: {inp.shape} → {out.shape}")
             
-            print("\n🎉 所有测试通过!")
+            print("\n🎉 测试完成!")
             
         except Exception as e:
             print(f"❌ 前向传播失败: {e}")
             import traceback
             traceback.print_exc()
-            
+        
     except Exception as e:
         print(f"❌ 测试失败: {e}")
         import traceback
