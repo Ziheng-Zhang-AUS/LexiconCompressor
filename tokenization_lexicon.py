@@ -1,22 +1,20 @@
 import csv
-import torch
-import torch.nn as nn
 from typing import List, Dict, Any, Optional
 
 class LexiconTokenizer:
     def __init__(self,
                  csv_file_path: str,
                  tokenizer: Any,
-                 embedding_layer: nn.Module,
                  column_names: List[str],
                  compress_token_id: int,
-                 delimiter: Optional[str] = None):
+                 delimiter: Optional[str] = None,
+                 add_special_tokens: bool = True):
         self.csv_file_path = csv_file_path
         self.tokenizer = tokenizer
-        self.embedding_layer = embedding_layer
         self.column_names = column_names
         self.compress_token_id = compress_token_id
         self.delimiter = delimiter if delimiter is not None else ','
+        self.add_special_tokens = add_special_tokens
         
         self.lexicon_data = self._load_lexicon()
 
@@ -37,9 +35,9 @@ class LexiconTokenizer:
         if not selected_texts:
             return ""
         
-        result_parts = [selected_texts[0] + ':'] + selected_texts[1:]
-        return self.delimiter.join(result_parts)
-    
+        result_parts = selected_texts[1:]
+        return selected_texts[0] + ':' + self.delimiter.join(result_parts)
+
     def process_lexicon(self):
         result_tensors = []
         
@@ -47,96 +45,63 @@ class LexiconTokenizer:
             text = self._extract_text_from_row(row)
             
             if text.strip(): 
-                tokens = self.tokenizer.encode(text, add_special_tokens=True)
-                final_tokens = [self.compress_token_id] + tokens
+                ids = self.tokenizer(text, add_special_tokens=self.add_special_tokens)['input_ids']
+                ids = ids[0] if ids and isinstance(ids[0], list) else ids
+                final_tokens = [self.compress_token_id] + ids
 
-                token_tensor = torch.tensor(final_tokens, dtype=torch.long)
-                
-                embedded = self.embedding_layer(token_tensor)
-                
-                result_tensors.append(embedded)
-        
+                result_tensors.append(final_tokens)
+
         return result_tensors
 
 
-
 def main():
-    from transformers import AutoTokenizer, AutoModel
-    # 加载Qwen3-0.6B的tokenizer和model
-    model_name = "Qwen/Qwen3-0.6B"  # 或者本地路径
-    print("Loading tokenizer and model...")
-    
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Please make sure you have installed the model or have internet connection")
-        return
-    
-    # 添加新的compress token
-    new_tokens = ['[COMP]']
-    num_added_toks = tokenizer.add_tokens(new_tokens)
-    print(f"Added {num_added_toks} new tokens")
-    
-    # 扩展embedding层
-    model.resize_token_embeddings(len(tokenizer))
-    
-    # 获取compress token的ID
-    compress_token_id = tokenizer.convert_tokens_to_ids('[COMP]')
-    print(f"Compress token ID: {compress_token_id}")
-    
-    # 创建LexiconTokenizer实例
-    lexicon_tokenizer = LexiconTokenizer(
-        csv_file_path="lexicon_demo.csv",
+    from transformers import AutoTokenizer
+
+    # 固定配置
+    MODEL_NAME = "Qwen/Qwen3-0.6B"
+    CSV_PATH   = "lexicon_demo.csv"
+    COLUMNS    = ["lexical_unit", "pos", "gloss", "variant"]
+
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
+    # 添加 [COMP]（作为普通 token，便于解码可见）
+    tokenizer.add_tokens(["[COMP]"], special_tokens=False)
+    comp_id = tokenizer.convert_tokens_to_ids("[COMP]")
+    print(f"[COMP] id = {comp_id}")
+
+    # 实例化你的 LexiconTokenizer（词典行一般不需要自动 special tokens）
+    lt = LexiconTokenizer(
+        csv_file_path=CSV_PATH,
         tokenizer=tokenizer,
-        embedding_layer=model.embed_tokens,
-        column_names=["lexical_unit", "pos", "gloss", "variant"],
-        compress_token_id=compress_token_id,
-        delimiter=","
+        column_names=COLUMNS,
+        compress_token_id=comp_id,
+        delimiter=",",
+        add_special_tokens=False
     )
-    
-    # 处理lexicon
-    print("\nProcessing lexicon...")
-    try:
-        result_tensors = lexicon_tokenizer.process_lexicon()
-        print(f"Processed {len(result_tensors)} lexicon entries")
-        
-        # 显示所有结果的详细信息
-        print("\n" + "="*80)
-        print("DETAILED RESULTS:")
-        print("="*80)
-        
-        for i, (row, tensor) in enumerate(zip(lexicon_tokenizer.lexicon_data, result_tensors)):
-            print(f"\nEntry {i+1}:")
-            print(f"  Original row: {row}")
-            
-            # 提取并显示原始文本
-            original_text = lexicon_tokenizer._extract_text_from_row(row)
-            print(f"  Extracted text: '{original_text}'")
-            
-            # 显示原始tokenization结果
-            original_tokens = tokenizer.encode(original_text, add_special_tokens=True)
-            print(f"  Original tokens: {original_tokens}")
-            print(f"  Original decoded (skip_special_tokens=True): '{tokenizer.decode(original_tokens, skip_special_tokens=True)}'")
-            print(f"  Original decoded (skip_special_tokens=False): '{tokenizer.decode(original_tokens, skip_special_tokens=False)}'")
-            
-            # 显示加上compress token后的结果
-            final_tokens = [compress_token_id] + original_tokens
-            print(f"  Final tokens (with [COMP]): {final_tokens}")
-            print(f"  Final decoded (skip_special_tokens=True): '{tokenizer.decode(final_tokens, skip_special_tokens=True)}'")
-            print(f"  Final decoded (skip_special_tokens=False): '{tokenizer.decode(final_tokens, skip_special_tokens=False)}'")
-            
-            # 显示tensor信息
-            print(f"  Embedded tensor shape: {tensor.shape}")
-            print(f"  Embedded tensor dtype: {tensor.dtype}")
-            
-            print("-" * 60)
-            
-    except Exception as e:
-        print(f"Error processing lexicon: {e}")
-        import traceback
-        traceback.print_exc()
+
+    # 处理并拿到“带 [COMP]”的 id 序列
+    all_ids_with_comp = lt.process_lexicon()
+    total = len(all_ids_with_comp)
+    print(f"Processed {total} entries. Showing first 5...\n")
+
+    # 打印前 5 行：抽取文本、无/有 [COMP] 的 ids 及解码
+    show_n = min(5, total)
+    for i in range(show_n):
+        row = lt.lexicon_data[i]
+        text = lt._extract_text_from_row(row).strip()
+        ids_no_comp = tokenizer.encode(text, add_special_tokens=False)
+        ids_with_comp = all_ids_with_comp[i]
+
+        print(f"Entry {i+1}")
+        print(f"  Extracted text: '{text}'")
+        print(f"  IDs (no [COMP]): {ids_no_comp}")
+        print(f"  Decode(no [COMP], skip_special=True):  '{tokenizer.decode(ids_no_comp, skip_special_tokens=True)}'")
+        print(f"  Decode(no [COMP], skip_special=False): '{tokenizer.decode(ids_no_comp, skip_special_tokens=False)}'")
+        print(f"  IDs (with [COMP] first): {ids_with_comp}")
+        print(f"  Decode(with [COMP], skip_special=True):  '{tokenizer.decode(ids_with_comp, skip_special_tokens=True)}'")
+        print(f"  Decode(with [COMP], skip_special=False): '{tokenizer.decode(ids_with_comp, skip_special_tokens=False)}'")
+        print("-" * 80)
 
 if __name__ == "__main__":
     main()
