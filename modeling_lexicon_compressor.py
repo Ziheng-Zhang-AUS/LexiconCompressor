@@ -38,6 +38,7 @@ class LexiconCompressorModel(nn.Module):
         
         self.embeddings = nn.Embedding(vocab_size, hidden_size)
         self.embeddings.load_state_dict(embedding_weights)
+        self.embeddings.to(torch.device("cuda")) 
         self._embeddings_loaded = True
     
     def load_attention_weights(self, attention_weights_list: List[Tuple[Dict, Dict]]):
@@ -120,117 +121,132 @@ def main():
     from transformers import AutoTokenizer, Qwen3ForCausalLM
     from tokenization_lexicon import LexiconTokenizer
 
-    # 固定配置
     MODEL_NAME = "Qwen/Qwen3-0.6B"
-    CSV_PATH   = "lexicon_demo.csv"
+    CSV_PATH   = "cleaned_lexicon_tiny.csv"
     COLUMNS    = ["lexical_unit", "pos", "gloss", "variant"]
-    NUM_LAYERS = 2       # Row/Column 注意力堆栈层数
-    SHOW_N     = 3       # 取前N行做演示，防止太慢
+    NUM_LAYERS = 6
+    SHOW_N     = 100
 
     torch.set_grad_enabled(False)
 
-    # 1) 加载分词器并添加 [COMP]
-    print("Loading tokenizer...")
+    # 1) tokenizer + [COMP]
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tok.add_tokens(["[COMP]"], special_tokens=False)
     comp_id = tok.convert_tokens_to_ids("[COMP]")
-    print(f"[COMP] id = {comp_id}")
 
-    # 2) 用你的 LexiconTokenizer 解析 CSV，得到每行 ids（前置 [COMP]）
+    # 2) CSV → token ids（每行前置 [COMP]）
     lt = LexiconTokenizer(
         csv_file_path=CSV_PATH,
         tokenizer=tok,
         column_names=COLUMNS,
         compress_token_id=comp_id,
         delimiter=",",
-        add_special_tokens=False  # 词典行一般不自动加 special tokens
+        add_special_tokens=False
     )
-    token_ids_list = lt.process_lexicon()
-    if not token_ids_list:
-        print("No entries parsed from CSV.")
-        return
-    token_ids_list = token_ids_list[:SHOW_N]
-    print(f"Prepared {len(token_ids_list)} entries from CSV.")
+    token_ids_list = lt.process_lexicon()[:SHOW_N]
+    assert token_ids_list, "No entries parsed from CSV."
 
-    # 3) 加载 Qwen 模型（只拿权重与 RoPE，不做前向）
-    print("Loading Qwen weights...")
-    qwen = Qwen3ForCausalLM.from_pretrained(MODEL_NAME)
-    cfg = qwen.config
-    rotary = qwen.model.rotary_emb  # 用于生成 RoPE (cos,sin)
+    # 3) Qwen 权重（embedding / 层 / RoPE）
+    qwen   = Qwen3ForCausalLM.from_pretrained(MODEL_NAME)
+    cfg    = qwen.config
+    rotary = qwen.model.rotary_emb
+    H      = cfg.hidden_size
 
-    # 4) 组装 LexiconCompressorModel，并加载 embedding/attention 权重
     lcm = LexiconCompressorModel(config=cfg, num_attention_layers=NUM_LAYERS)
-
-    # embedding 权重来自 Qwen 的词嵌入
-    emb_weights = qwen.get_input_embeddings().state_dict()  # {"weight": tensor}
-    # 每层 (row_weights, col_weights)；这里用 Qwen 的第 0..(2*NUM_LAYERS-1) 层作为初始化
+    emb_weights = qwen.get_input_embeddings().state_dict()
     attn_weights = []
     for i in range(NUM_LAYERS):
         row_sd = qwen.model.layers[2*i].state_dict()
-        col_sd = qwen.model.layers[2*i + 1].state_dict()
+        col_sd = qwen.model.layers[2*i+1].state_dict()
         attn_weights.append((row_sd, col_sd))
 
-    # 5) 构造 RoPE 与全可见 mask
+    # --------- helpers: 构造 RoPE / mask，并前向一次 ----------
     def full_vis_mask(L: int):
-        # 4D 全 0：形状 [B, 1, Q, K]，非因果，全可见
         return torch.zeros(1, 1, L, L, dtype=torch.float32)
 
-    def row_rope_for_len(L: int, H: int):
+    def row_rope(L: int):
         dummy = torch.zeros(1, L, H)
-        pos_ids = torch.arange(L).unsqueeze(0)
-        return rotary(dummy, pos_ids)  # (cos, sin)
+        pos   = torch.arange(L).unsqueeze(0)
+        return rotary(dummy, pos)  # 有序 RoPE
 
-    def col_identity_rope(N: int, H: int):
+    def col_identity_rope(N: int):
         dummy = torch.zeros(1, N, H)
-        pos_ids0 = torch.zeros(1, N, dtype=torch.long)
-        return rotary(dummy, pos_ids0)  # cos=1, sin=0
+        pos0  = torch.zeros(1, N, dtype=torch.long)
+        return rotary(dummy, pos0)  # identity（无序）
 
-    H = cfg.hidden_size
-    # 行：每层都需要为“每一行”准备 (cos,sin) 与 mask
-    row_pos_embs_per_layer = []
-    row_masks_per_layer = []
-    for _ in range(NUM_LAYERS):
-        row_pos_embs = []
-        row_masks = []
-        for ids in token_ids_list:
-            L = len(ids)
-            row_pos_embs.append(row_rope_for_len(L, H))
-            row_masks.append(full_vis_mask(L))
-        row_pos_embs_per_layer.append(row_pos_embs)
-        row_masks_per_layer.append(row_masks)
+    def build_inputs(tids):
+        # 行：每层都要一份（简单复制）
+        row_pos = []; row_msk = []
+        for _ in range(NUM_LAYERS):
+            row_pos.append([row_rope(len(x)) for x in tids])
+            row_msk.append([full_vis_mask(len(x)) for x in tids])
+        # 列：每层一份
+        N = len(tids)
+        col_pos = [col_identity_rope(N) for _ in range(NUM_LAYERS)]
+        col_msk = [full_vis_mask(N)     for _ in range(NUM_LAYERS)]
+        return row_pos, row_msk, col_pos, col_msk
 
-    # 列：每层一个 (cos,sin) 与 mask（长度为行数）
-    N = len(token_ids_list)
-    col_pos_embs_per_layer = [col_identity_rope(N, H) for _ in range(NUM_LAYERS)]
-    col_masks_per_layer    = [full_vis_mask(N) for _ in range(NUM_LAYERS)]
+    def fwd_once(tids):
+        row_pos, row_msk, col_pos, col_msk = build_inputs(tids)
+        out_rows = lcm(
+            token_ids_list=tids,
+            attention_weights=attn_weights,
+            embeddings_weights=emb_weights,
+            row_attention_masks=row_msk,
+            column_attention_masks=col_msk,
+            row_position_embeddings=row_pos,
+            column_position_embeddings=col_pos
+        )
+        # 取每行容器（行首 [COMP]）向量
+        heads = torch.stack([r[0].detach().cpu() for r in out_rows], dim=0)
+        return out_rows, heads
+    # ------------------------------------------------------------
 
-    # 6) 前向：把 token ids、权重、RoPE、mask 一次性喂给压缩器
-    print("Forward...")
-    out_rows = lcm(
-        token_ids_list=token_ids_list,
-        attention_weights=attn_weights,
-        embeddings_weights=emb_weights,
-        row_attention_masks=row_masks_per_layer,
-        column_attention_masks=col_masks_per_layer,
-        row_position_embeddings=row_pos_embs_per_layer,
-        column_position_embeddings=col_pos_embs_per_layer
-    )
+    print("Forward once (baseline)...")
+    out_rows, heads = fwd_once(token_ids_list)
+    for i, (ids, row) in enumerate(zip(token_ids_list, out_rows)):
+        print(f"Row {i}: ids_len={len(ids)} -> out_shape={tuple(row.shape)}; head_norm={row[0].norm().item():.4f}")
 
-    # 7) 打印结果（形状与行首 token 范数变化）
-    print("Results:")
-    # 先手动生成一次“embedding 前”的行首向量范数做对比
-    with torch.no_grad():
-        emb_layer = lcm.embeddings
-        in_head_norms = []
-        for ids in token_ids_list:
-            x = emb_layer(torch.tensor(ids, dtype=torch.long))  # [L,H]
-            in_head_norms.append(x[0].norm().item())
+    # ============== 测试 1：列无序（列应对行顺序不敏感） ==============
+    import random
+    perm = list(range(len(token_ids_list)))
+    random.shuffle(perm)
+    perm_tids = [token_ids_list[i] for i in perm]
+    _, heads_perm = fwd_once(perm_tids)
 
-    for i, (ids, row, in_norm) in enumerate(zip(token_ids_list, out_rows, in_head_norms)):
-        print(f"Row {i}: ids_len={len(ids)} -> out_shape={tuple(row.shape)}; "
-              f"head-norm before={in_norm:.4f}, after={row[0].norm().item():.4f}")
+    assert torch.allclose(heads_perm, heads[perm], atol=1e-5, rtol=1e-5), \
+        "Column invariance FAILED: shuffling rows changed container vectors beyond permutation."
+    print("Test#1 Column invariance: OK ✅")
 
-    print("Done.")
+    # ============ 测试 2：行有序（行内交换 token 应改变输出） ============
+    # 选第一行，尝试交换两个非 [COMP] 的位置（确保长度≥3）
+    swapped_tids = [x[:] for x in token_ids_list]
+    if len(swapped_tids[0]) >= 3:
+        i0, j0 = 1, 2  # 交换第1/2个真实 token（0 是 [COMP]）
+        swapped_tids[0][i0], swapped_tids[0][j0] = swapped_tids[0][j0], swapped_tids[0][i0]
+        _, heads_swapped = fwd_once(swapped_tids)
+        assert not torch.allclose(heads_swapped[0], heads[0], atol=1e-6), \
+            "Row order FAILED: swapping tokens did not change row container."
+        print("Test#2 Row order sensitivity: OK ✅")
+    else:
+        print("Test#2 Row order sensitivity: SKIP (row too short)")
+
+    # ====== 测试 3：非因果（右侧信息能影响左侧容器 [COMP]） ======
+    # 在第一行，把靠右的一个 token 替换成随机向量对应的“影子 token id”（这里简单用重复交换来模拟变化）
+    # 更直接的做法是替换一个右侧 token（i>=2）为另一个 id
+    noncausal_tids = [x[:] for x in token_ids_list]
+    if len(noncausal_tids[0]) >= 4:
+        # 交换更靠右的位置，查看 [COMP] 是否受影响
+        i1, j1 = 2, 3
+        noncausal_tids[0][i1], noncausal_tids[0][j1] = noncausal_tids[0][j1], noncausal_tids[0][i1]
+        _, heads_noncausal = fwd_once(noncausal_tids)
+        assert not torch.allclose(heads_noncausal[0], heads[0], atol=1e-6), \
+            "Non-causal FAILED: changing right-side tokens did not affect [COMP]."
+        print("Test#3 Non-causal (full visibility): OK ✅")
+    else:
+        print("Test#3 Non-causal (full visibility): SKIP (row too short)")
+
+    print("All tests passed 🎉")
 
 if __name__ == "__main__":
     main()

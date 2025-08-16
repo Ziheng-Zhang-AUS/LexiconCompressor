@@ -27,6 +27,10 @@ class RowColumnAttention(nn.Module):
         row_layer_weights: Optional[Dict[str, torch.Tensor]] = None,
         col_layer_weights: Optional[Dict[str, torch.Tensor]] = None
     ):
+        
+        for k, row_embed in enumerate(embedded_rows):
+            print(f">>> row[{k}].device =", row_embed.device)
+        print(">>> row_layernorm.weight.device =", self.row_attention_layer.input_layernorm.weight.device)
 
         if not self._weights_loaded:
             if row_layer_weights is None:
