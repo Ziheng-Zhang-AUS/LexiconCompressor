@@ -133,13 +133,13 @@ def main():
     MODEL_NAME   = "Qwen/Qwen3-0.6B"
     CSV_PATH     = "cleaned_lexicon_tiny.csv"
     COLUMNS      = ["lexical_unit", "pos", "gloss", "variant"]
-    NUM_LAYERS   = 6           # 注意：需与 RowColumnAttentionStack 初始化一致
-    SHOW_N       = 100         # 取前 N 行做测试
-    ATOL         = 1e-5        # 数值容差（按需调）
+    NUM_LAYERS   = 6           
+    SHOW_N       = 100         
+    ATOL         = 1e-5        
     RTOL         = 1e-5
     SEED         = 0
-    PRINT_DIFF   = True        # 失败/诊断时打印最大差值
-    STRESS_ROUNDS= 8           # 多轮随机置换压力测试次数（>0 开启）
+    PRINT_DIFF   = True        
+    STRESS_ROUNDS= 8           
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -157,19 +157,18 @@ def main():
 
     # --------------- Helper: masks & RoPE ---------------
     def full_vis_mask(L: int, device=device):
-        # 加性 mask：全可见 -> 全 0
-        return torch.zeros(1, 1, L, L, dtype=torch.float32, device=device)
+        return torch.ones(1, 1, L, L, dtype=torch.float32, device=device)
 
     def build_row_rope(rotary, L: int, H: int, device=device):
         # 行 RoPE：顺序编码
-        dummy = torch.zeros(1, L, H, device=device)
+        dummy = torch.ones(1, L, H, device=device)
         pos   = torch.arange(L, device=device).unsqueeze(0)
         return rotary(dummy, pos)
 
     def build_col_identity_rope(rotary, N: int, H: int, device=device):
         # 列 RoPE：恒等（同相位），保证置换等变
-        dummy = torch.zeros(1, N, H, device=device)
-        pos0  = torch.zeros(1, N, dtype=torch.long, device=device)
+        dummy = torch.ones(1, N, H, device=device)
+        pos0  = torch.ones(1, N, dtype=torch.long, device=device)
         return rotary(dummy, pos0)
 
     # --------------- Load tokenizer & lexicon ---------------
