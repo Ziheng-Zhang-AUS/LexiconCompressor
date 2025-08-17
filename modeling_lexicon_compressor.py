@@ -107,7 +107,7 @@ class LexiconCompressorModel(nn.Module):
         # 1. Tokenize and embed
         embedded_rows = self.tokenize_and_embed(token_ids_list)
         
-        # 2. Process through row-column attention stack
+        # 2. Process through row-column attention stack.
         compressed_rows = self.attention_stack(
             embedded_rows=embedded_rows,
             row_attention_masks=row_attention_masks,
@@ -120,30 +120,63 @@ class LexiconCompressorModel(nn.Module):
 
 
 def main():
+    """
+    A rigorous, reproducible test harness for LexiconCompressorModel.
+    Focus: self-consistency, column permutation-equivariance, row order sensitivity, non-causality.
+    """
+    import os, random, numpy as np, time
     import torch
     from transformers import AutoTokenizer, Qwen3ForCausalLM
     from tokenization_lexicon import LexiconTokenizer
-    import os
 
-    # Disable tokenizer parallelism warning
+    # ---------------- Config ----------------
+    MODEL_NAME   = "Qwen/Qwen3-0.6B"
+    CSV_PATH     = "cleaned_lexicon_tiny.csv"
+    COLUMNS      = ["lexical_unit", "pos", "gloss", "variant"]
+    NUM_LAYERS   = 6           # 注意：需与 RowColumnAttentionStack 初始化一致
+    SHOW_N       = 100         # 取前 N 行做测试
+    ATOL         = 1e-5        # 数值容差（按需调）
+    RTOL         = 1e-5
+    SEED         = 0
+    PRINT_DIFF   = True        # 失败/诊断时打印最大差值
+    STRESS_ROUNDS= 8           # 多轮随机置换压力测试次数（>0 开启）
+
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    MODEL_NAME = "Qwen/Qwen3-0.6B"
-    CSV_PATH   = "cleaned_lexicon_tiny.csv"
-    COLUMNS    = ["lexical_unit", "pos", "gloss", "variant"]
-    NUM_LAYERS = 6
-    SHOW_N     = 100
+    # --------------- Determinism ---------------
+    def fix_seeds(seed=SEED):
+        random.seed(seed); np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
-    torch.set_grad_enabled(False)
+    fix_seeds(SEED)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"[Env] device={device}, torch={torch.__version__}")
 
-    # 1) Tokenizer + [COMP]
+    # --------------- Helper: masks & RoPE ---------------
+    def full_vis_mask(L: int, device=device):
+        # 加性 mask：全可见 -> 全 0
+        return torch.zeros(1, 1, L, L, dtype=torch.float32, device=device)
+
+    def build_row_rope(rotary, L: int, H: int, device=device):
+        # 行 RoPE：顺序编码
+        dummy = torch.zeros(1, L, H, device=device)
+        pos   = torch.arange(L, device=device).unsqueeze(0)
+        return rotary(dummy, pos)
+
+    def build_col_identity_rope(rotary, N: int, H: int, device=device):
+        # 列 RoPE：恒等（同相位），保证置换等变
+        dummy = torch.zeros(1, N, H, device=device)
+        pos0  = torch.zeros(1, N, dtype=torch.long, device=device)
+        return rotary(dummy, pos0)
+
+    # --------------- Load tokenizer & lexicon ---------------
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tok.add_tokens(["[COMP]"], special_tokens=False)
     comp_id = tok.convert_tokens_to_ids("[COMP]")
 
-    # 2) CSV → token ids (prepend [COMP] to each row)
     lt = LexiconTokenizer(
         csv_file_path=CSV_PATH,
         tokenizer=tok,
@@ -152,109 +185,157 @@ def main():
         delimiter=",",
         add_special_tokens=False
     )
-    token_ids_list = lt.process_lexicon()[:SHOW_N]
+    token_ids_list = lt.process_lexicon()
     assert token_ids_list, "No entries parsed from CSV."
+    token_ids_list = token_ids_list[:SHOW_N]
 
-    # 3) Qwen weights (embedding / layers / RoPE)
-    qwen   = Qwen3ForCausalLM.from_pretrained(MODEL_NAME).to(device)
+    # --------------- Load Qwen weights for init ---------------
+    qwen   = Qwen3ForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True).to(device)
     cfg    = qwen.config
     rotary = qwen.model.rotary_emb
     H      = cfg.hidden_size
 
+    # --------------- Build LCM and load weights ---------------
     lcm = LexiconCompressorModel(config=cfg, num_attention_layers=NUM_LAYERS).to(device)
     emb_weights = qwen.get_input_embeddings().state_dict()
+
     attn_weights = []
     for i in range(NUM_LAYERS):
+        # 约定：偶数层 = row 分支，奇数层 = column 分支（按你实现调整）
         row_sd = qwen.model.layers[2*i].state_dict()
-        col_sd = qwen.model.layers[2*i+1].state_dict()
+        col_sd = qwen.model.layers[2*i + 1].state_dict()
         attn_weights.append((row_sd, col_sd))
 
-    # --------- Helpers: Build RoPE / mask and forward once ----------
-    def full_vis_mask(L: int):
-        return torch.zeros(1, 1, L, L, dtype=torch.float32, device=device)
+    # 确保评估模式（禁用 Dropout/DropPath）
+    lcm.eval()
+    # 若你有自定义 Dropout，可强制置 0
+    for m in lcm.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.p = 0.0
 
-    def row_rope(L: int):
-        dummy = torch.zeros(1, L, H, device=device)
-        pos   = torch.arange(L, device=device).unsqueeze(0)
-        return rotary(dummy, pos)  # Ordered RoPE
+    # 一次性加载权重
+    lcm.load_embeddings_weights(emb_weights)
+    lcm.load_attention_weights(attn_weights)
 
-    def col_identity_rope(N: int):
-        dummy = torch.zeros(1, N, H, device=device)
-        pos0  = torch.zeros(1, N, dtype=torch.long, device=device)
-        return rotary(dummy, pos0)  # Identity (unordered)
-
-    def build_inputs(tids):
-        # Rows: each layer needs a copy (simple replication)
-        row_pos = []; row_msk = []
+    # --------------- Build inputs for one forward ---------------
+    def build_inputs(tids_list):
+        # row：每一层都要一份（可复用同构造）
+        row_pos_layers, row_msk_layers = [], []
         for _ in range(NUM_LAYERS):
-            row_pos.append([row_rope(len(x)) for x in tids])
-            row_msk.append([full_vis_mask(len(x)) for x in tids])
-        # Columns: one per layer
-        N = len(tids)
-        col_pos = [col_identity_rope(N) for _ in range(NUM_LAYERS)]
-        col_msk = [full_vis_mask(N)     for _ in range(NUM_LAYERS)]
-        return row_pos, row_msk, col_pos, col_msk
+            row_pos = [build_row_rope(rotary, len(x), H) for x in tids_list]
+            row_msk = [full_vis_mask(len(x)) for x in tids_list]
+            row_pos_layers.append(row_pos)
+            row_msk_layers.append(row_msk)
+        # column：每层一份
+        N = len(tids_list)
+        col_pos_layers = [build_col_identity_rope(rotary, N, H) for _ in range(NUM_LAYERS)]
+        col_msk_layers = [full_vis_mask(N) for _ in range(NUM_LAYERS)]
+        return row_pos_layers, row_msk_layers, col_pos_layers, col_msk_layers
 
-    def fwd_once(tids):
-        row_pos, row_msk, col_pos, col_msk = build_inputs(tids)
+    # --------------- Forward wrapper ---------------
+    @torch.no_grad()
+    def forward_heads(tids_list):
+        row_pos, row_msk, col_pos, col_msk = build_inputs(tids_list)
         out_rows = lcm(
-            token_ids_list=tids,
-            attention_weights=attn_weights,
-            embeddings_weights=emb_weights,
+            token_ids_list=tids_list,
+            attention_weights=None,            # 已在 lcm 内部装载
+            embeddings_weights=None,
             row_attention_masks=row_msk,
             column_attention_masks=col_msk,
             row_position_embeddings=row_pos,
             column_position_embeddings=col_pos
         )
-        # Extract container vectors ([COMP] tokens) from each row
+        # 取每行第 0 个 token（[COMP]）的向量作为“容器向量”
         heads = torch.stack([r[0].detach().cpu() for r in out_rows], dim=0)
-        return out_rows, heads
-    # ------------------------------------------------------------
+        return heads
 
-    print("Forward once (baseline)...")
-    out_rows, heads = fwd_once(token_ids_list)
-    for i, (ids, row) in enumerate(zip(token_ids_list, out_rows)):
-        print(f"Row {i}: ids_len={len(ids)} -> out_shape={tuple(row.shape)}; head_norm={row[0].norm().item():.4f}")
+    # --------------- Test 0: Self-consistency ---------------
+    print("\n[Test 0] Self-consistency...")
+    fix_seeds(SEED)  # 保证一致
+    hA1 = forward_heads(token_ids_list)
+    fix_seeds(SEED)
+    hA2 = forward_heads(token_ids_list)
 
-    # ============== Test 1: Column invariance (column should be insensitive to row order) ==============
-    import random
+    self_ok = torch.allclose(hA1, hA2, atol=ATOL, rtol=RTOL)
+    max_self_diff = (hA1 - hA2).abs().max().item()
+    print(f" -> allclose={self_ok}, max_abs_diff={max_self_diff:.3e}")
+    assert self_ok, f"Self-consistency FAILED (max diff {max_self_diff:.3e})"
+
+    # --------------- Test 1: Column permutation-equivariance ---------------
+    print("\n[Test 1] Column permutation-equivariance...")
+    fix_seeds(SEED)
+    base_heads = forward_heads(token_ids_list)
+
     perm = list(range(len(token_ids_list)))
     random.shuffle(perm)
     perm_tids = [token_ids_list[i] for i in perm]
-    _, heads_perm = fwd_once(perm_tids)
 
-    assert torch.allclose(heads_perm, heads[perm], atol=1e-5, rtol=1e-5), \
-        "Column invariance FAILED: shuffling rows changed container vectors beyond permutation."
-    print("Test#1 Column invariance: OK ✅")
+    fix_seeds(SEED)   # 重要：相同随机态（尽管 eval+no-dropout 应当已无随机性）
+    perm_heads = forward_heads(perm_tids)
 
-    # ============ Test 2: Row order sensitivity (swapping tokens within row should change output) ============
-    # Select first row, try swapping two non-[COMP] positions (ensure length≥3)
-    swapped_tids = [x[:] for x in token_ids_list]
-    if len(swapped_tids[0]) >= 3:
-        i0, j0 = 1, 2  # Swap 1st/2nd real tokens (0 is [COMP])
-        swapped_tids[0][i0], swapped_tids[0][j0] = swapped_tids[0][j0], swapped_tids[0][i0]
-        _, heads_swapped = fwd_once(swapped_tids)
-        assert not torch.allclose(heads_swapped[0], heads[0], atol=1e-6), \
-            "Row order FAILED: swapping tokens did not change row container."
-        print("Test#2 Row order sensitivity: OK ✅")
+    # 应满足 perm_heads ≈ base_heads[perm]
+    ref = base_heads[perm]
+    eq_ok = torch.allclose(perm_heads, ref, atol=ATOL, rtol=RTOL)
+    max_perm_diff = (perm_heads - ref).abs().max().item()
+    print(f" -> allclose={eq_ok}, max_abs_diff={max_perm_diff:.3e}")
+    if not eq_ok and PRINT_DIFF:
+        print("   (DIAG) perm example idx 0 diff norm:",
+              torch.norm(perm_heads[0] - ref[0]).item())
+    assert eq_ok, f"Column invariance FAILED (max diff {max_perm_diff:.3e}). " \
+                  f"检查列注意力是否非因果、是否无绝对列 position_ids、掩码是否全可见。"
+
+    # --------------- Test 2: Row order sensitivity ---------------
+    print("\n[Test 2] Row order sensitivity (intra-row swap should change head)...")
+    swapped = [x[:] for x in token_ids_list]
+    # 选第一行，交换第 1/2 个真实 token（0 是 [COMP]）
+    if len(swapped[0]) >= 3:
+        i0, j0 = 1, 2
+        swapped[0][i0], swapped[0][j0] = swapped[0][j0], swapped[0][i0]
+        fix_seeds(SEED)
+        h_swap = forward_heads(swapped)
+        change_norm = torch.norm(h_swap[0] - base_heads[0]).item()
+        changed = change_norm > 1e-6
+        print(f" -> changed={changed}, head_delta_norm={change_norm:.3e}")
+        assert changed, "Row order sensitivity FAILED: swapping tokens did not change the container."
     else:
-        print("Test#2 Row order sensitivity: SKIP (row too short)")
+        print(" -> SKIP (first row too short)")
 
-    # ====== Test 3: Non-causal (right-side information should affect left-side container [COMP]) ======
-    # In first row, replace a right-side token with another id
-    noncausal_tids = [x[:] for x in token_ids_list]
-    if len(noncausal_tids[0]) >= 4:
-        # Swap more right-side positions, check if [COMP] is affected
+    # --------------- Test 3: Non-causality ---------------
+    print("\n[Test 3] Non-causality (right-side change should affect [COMP])...")
+    noncausal = [x[:] for x in token_ids_list]
+    if len(noncausal[0]) >= 4:
         i1, j1 = 2, 3
-        noncausal_tids[0][i1], noncausal_tids[0][j1] = noncausal_tids[0][j1], noncausal_tids[0][i1]
-        _, heads_noncausal = fwd_once(noncausal_tids)
-        assert not torch.allclose(heads_noncausal[0], heads[0], atol=1e-6), \
-            "Non-causal FAILED: changing right-side tokens did not affect [COMP]."
-        print("Test#3 Non-causal (full visibility): OK ✅")
+        noncausal[0][i1], noncausal[0][j1] = noncausal[0][j1], noncausal[0][i1]
+        fix_seeds(SEED)
+        h_nc = forward_heads(noncausal)
+        delta = torch.norm(h_nc[0] - base_heads[0]).item()
+        affected = delta > 1e-6
+        print(f" -> affected={affected}, head_delta_norm={delta:.3e}")
+        assert affected, "Non-causality FAILED: changing right-side tokens did not affect [COMP]."
     else:
-        print("Test#3 Non-causal (full visibility): SKIP (row too short)")
+        print(" -> SKIP (first row too short)")
 
-    print("All tests passed 🎉")
+    # --------------- (Optional) Stress test ---------------
+    if STRESS_ROUNDS > 0:
+        print(f"\n[Stress] {STRESS_ROUNDS} random permutations ...")
+        pass_cnt, max_seen = 0, 0.0
+        for r in range(STRESS_ROUNDS):
+            perm = list(range(len(token_ids_list)))
+            random.shuffle(perm)
+            perm_tids = [token_ids_list[i] for i in perm]
+            fix_seeds(SEED)
+            ph = forward_heads(perm_tids)
+            ref = base_heads[perm]
+            ok = torch.allclose(ph, ref, atol=ATOL, rtol=RTOL)
+            diff = (ph - ref).abs().max().item()
+            max_seen = max(max_seen, diff)
+            pass_cnt += int(ok)
+        print(f" -> pass {pass_cnt}/{STRESS_ROUNDS}, max_abs_diff_seen={max_seen:.3e}")
+        assert pass_cnt == STRESS_ROUNDS, \
+            f"Permutation equivariance flaky: only {pass_cnt}/{STRESS_ROUNDS} passes (max diff {max_seen:.3e})."
+
+    print("\nAll tests passed 🎉")
+
 
 
 if __name__ == "__main__":
