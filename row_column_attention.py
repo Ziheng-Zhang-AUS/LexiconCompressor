@@ -6,6 +6,12 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3Con
 
 class RowColumnAttention(nn.Module):
     def __init__(self, config: Qwen3Config):
+        """
+        Initialize row and column attention module.
+
+        Args:
+            config: Qwen3Config
+        """
         super().__init__()
         self.config = config
         self.row_attention_layer = Qwen3DecoderLayer(config=config, layer_idx=0)
@@ -13,6 +19,13 @@ class RowColumnAttention(nn.Module):
         self._weights_loaded = False
 
     def load_weights_once(self, row_weights: Dict, col_weights: Dict):
+        """
+        Load weights for the decoder layer(Class: Qwen3DecoderLayer) of row attention and column attention.
+
+        Args:
+            row_weights: decoder layer weights of row attention part
+            column_weights: decoder layer weights of column attention part
+        """
         self.row_attention_layer.load_state_dict(row_weights)
         self.column_attention_layer.load_state_dict(col_weights)
         self._weights_loaded = True
@@ -27,10 +40,27 @@ class RowColumnAttention(nn.Module):
         row_layer_weights: Optional[Dict[str, torch.Tensor]] = None,
         col_layer_weights: Optional[Dict[str, torch.Tensor]] = None
     ):
+        """
+        Args:
+            embedded_rows: Hidden state of the dictionary. Each element representing a row of the dictionary, with shape of (seq_len, hidden_size). The first element should be compress token instead.
+
+            row_attention_mask: Attention mask of each row, which should be ones tensor. 
+
+            column_attention_mask: Attention mask of the first column(compress token).
+
+            row_position_embeddings: RoPE of each row, which should have position info, because the tokens within a row are order sensitive.
+
+            column_position_embeddings: RoPE of the first column, which should not have position info, because the compress tokens are not order sensitive.
+
+            row_layer_weights: Weights should be loaded for the decoder layer of row attention.
+
+            column_layer_weights: Weights should be loaded for the decoder layer of column attention.
+
+        """
         
-        for k, row_embed in enumerate(embedded_rows):
-            print(f">>> row[{k}].device =", row_embed.device)
-        print(">>> row_layernorm.weight.device =", self.row_attention_layer.input_layernorm.weight.device)
+        # for k, row_embed in enumerate(embedded_rows):
+        # print(f">>> row[{k}].device =", row_embed.device)
+        # print(">>> row_layernorm.weight.device =", self.row_attention_layer.input_layernorm.weight.device)
 
         if not self._weights_loaded:
             if row_layer_weights is None:
@@ -99,26 +129,21 @@ class RowColumnAttention(nn.Module):
 
 if __name__ == "__main__":
     from transformers import Qwen3Config, Qwen3ForCausalLM
-    # 直接导入Qwen3RotaryEmbedding
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
     import torch
     
-    print("🔍 开始测试 RowColumnAttention...")
-    
+    print("Testing RowColumnAttention...")
     try:
-        # 1. 加载Qwen3-0.6B模型
-        print("📥 加载Qwen3-0.6B模型...")
+        print("Load Qwen3 Model and Config...")
         try:
             qwen_model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
             config = qwen_model.config
-            print("✅ 成功加载Qwen3-0.6B模型和配置")
-            
-            # 直接使用Qwen的rotary_emb
             qwen_rotary_emb = qwen_model.model.rotary_emb
+            print("Success: Load Qwen3 Model and Config")
             
         except Exception as e:
-            print(f"⚠️  无法加载Qwen3-0.6B: {e}")
-            print("💡 使用模拟配置")
+            print(f"Failed to Load Qwen3 Model and Config: {e}")
+            print("Use Fake Config instead...")
             config = Qwen3Config(
                 vocab_size=32000,
                 hidden_size=1024,
@@ -131,39 +156,34 @@ if __name__ == "__main__":
             )
             qwen_rotary_emb = None
         
-        # 2. 创建处理器
         processor = RowColumnAttention(config)
-        print("✅ RowColumnAttention 创建成功")
+        print("RowColumnAttention Created...")
         
-        # 3. 准备测试数据
         embedded_rows = [
-            torch.randn(4, config.hidden_size),  # 行1：4个token
-            torch.randn(3, config.hidden_size),  # 行2：3个token  
-            torch.randn(5, config.hidden_size),  # 行3：5个token
+            torch.randn(4, config.hidden_size),  
+            torch.randn(3, config.hidden_size),  
+            torch.randn(5, config.hidden_size),  
         ]
         
         device = embedded_rows[0].device
-        print(f"✅ 测试数据准备完成 (设备: {device})")
-        print(f"   - 行长度: {[row.shape[0] for row in embedded_rows]}")
+        print(f"Test Data Prepared (Device: {device})")
+        print(f"   - Row Length: {[row.shape[0] for row in embedded_rows]}")
         
-        # 4. 获取权重
-        print("📥 获取权重...")
+        print("Start getting the weights...")
         try:
             if qwen_rotary_emb is not None:
                 row_weights = qwen_model.model.layers[0].state_dict()
                 col_weights = qwen_model.model.layers[1].state_dict()
-                print("✅ 使用真实的Qwen权重")
+                print("Use Real Qwen3 Weights")
             else:
                 raise Exception("No real model")
         except:
-            print("⚠️  使用随机权重")
+            print("Failed to load Qwen3 Weights, Use fake Weights instead...")
             row_weights = {name: torch.randn_like(param) for name, param in processor.row_attention_layer.named_parameters()}
             col_weights = {name: torch.randn_like(param) for name, param in processor.column_attention_layer.named_parameters()}
         
-        # 5. 创建行和列的位置编码
-        print("🔄 创建行和列位置编码...")
+        print("Creating Row and Column RoPE...")
         
-        # 为每行创建匹配长度的位置编码
         row_position_embeddings = []
         for row in embedded_rows:
             seq_len = row.shape[0]
@@ -175,9 +195,8 @@ if __name__ == "__main__":
                 rotary_emb = Qwen3RotaryEmbedding(config=config)
                 pos_emb = rotary_emb(dummy_input, position_ids)
             row_position_embeddings.append(pos_emb)
-            print(f"   - 行位置编码 (长度{seq_len}): {[p.shape for p in pos_emb]}")
+            print(f"   - Row Rope (Length{seq_len}): {[p.shape for p in pos_emb]}")
         
-        # 为列创建位置编码
         num_rows = len(embedded_rows)
         col_dummy_input = torch.randn(1, num_rows, config.hidden_size, device=device)
         col_position_ids = torch.arange(num_rows, device=device).unsqueeze(0)
@@ -187,10 +206,9 @@ if __name__ == "__main__":
             rotary_emb = Qwen3RotaryEmbedding(config=config)
             column_position_embeddings = rotary_emb(col_dummy_input, col_position_ids)
         
-        print(f"   - 列位置编码 (长度{num_rows}): {[p.shape for p in column_position_embeddings]}")
+        print(f"   - Column RoPE (Length{num_rows}): {[p.shape for p in column_position_embeddings]}")
         
-        # 6. 测试前向传播
-        print("🔄 测试前向传播...")
+        print("Testing Forward Propagation...")
         try:
             output_rows = processor(
                 embedded_rows=embedded_rows,
@@ -200,21 +218,21 @@ if __name__ == "__main__":
                 column_position_embeddings=column_position_embeddings
             )
             
-            print("✅ 测试成功!")
-            print(f"   - 输入行数: {len(embedded_rows)}")
-            print(f"   - 输出行数: {len(output_rows)}")
+            print("Success: Forward Propagation!")
+            print(f"   - Input Row number: {len(embedded_rows)}")
+            print(f"   - Output Row number: {len(output_rows)}")
             
             for i, (inp, out) in enumerate(zip(embedded_rows, output_rows)):
-                print(f"   - 行{i}: {inp.shape} → {out.shape}")
+                print(f"   - Row{i}: {inp.shape} → {out.shape}")
             
-            print("\n🎉 测试完成!")
+            print("Success: Testing")
             
         except Exception as e:
-            print(f"❌ 前向传播失败: {e}")
+            print(f"Failed to Forward Propagation: {e}")
             import traceback
             traceback.print_exc()
         
     except Exception as e:
-        print(f"❌ 测试失败: {e}")
+        print(f"Failed to Test: {e}")
         import traceback
         traceback.print_exc()

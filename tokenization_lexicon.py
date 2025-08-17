@@ -9,6 +9,25 @@ class LexiconTokenizer:
                  compress_token_id: int,
                  delimiter: Optional[str] = None,
                  add_special_tokens: bool = True):
+        """
+        Initialize lexicon tokenizer
+
+        Args:
+            csv_file_path: a csv file for dictoinary. The first line should be column names.
+
+            tokenizer: Qwen3 tokenizer, which normally should be added a new token as compress token.
+
+            colulmns_names: the columns that are used to input.
+
+            compress_token_id: the token id which is used as compress token.
+
+            delimiter: delimiter used to form the input. 
+                Example: delimiter=',', row: yajinga, Verb, to go
+                    Output: yajinga:Verb,to go
+                    The lexicon unit will always be followed by ':', and the other component will be joined by delimiter.
+
+            add_special_tokens: args for Qwen3 tokenizer.
+        """
         self.csv_file_path = csv_file_path
         self.tokenizer = tokenizer
         self.column_names = column_names
@@ -57,7 +76,7 @@ class LexiconTokenizer:
 def main():
     from transformers import AutoTokenizer
 
-    # 固定配置
+    # Fixed configuration
     MODEL_NAME = "Qwen/Qwen3-0.6B"
     CSV_PATH   = "lexicon_demo.csv"
     COLUMNS    = ["lexical_unit", "pos", "gloss", "variant"]
@@ -65,12 +84,12 @@ def main():
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
-    # 添加 [COMP]（作为普通 token，便于解码可见）
+    # Add [COMP] as a regular token for visibility during decoding
     tokenizer.add_tokens(["[COMP]"], special_tokens=False)
     comp_id = tokenizer.convert_tokens_to_ids("[COMP]")
     print(f"[COMP] id = {comp_id}")
 
-    # 实例化你的 LexiconTokenizer（词典行一般不需要自动 special tokens）
+    # Instantiate your LexiconTokenizer 
     lt = LexiconTokenizer(
         csv_file_path=CSV_PATH,
         tokenizer=tokenizer,
@@ -80,28 +99,24 @@ def main():
         add_special_tokens=False
     )
 
-    # 处理并拿到“带 [COMP]”的 id 序列
+    # Process and get ID sequences with [COMP] tokens
     all_ids_with_comp = lt.process_lexicon()
     total = len(all_ids_with_comp)
     print(f"Processed {total} entries. Showing first 5...\n")
 
-    # 打印前 5 行：抽取文本、无/有 [COMP] 的 ids 及解码
+    # Display first 5 entries: extract text, encode, then decode
     show_n = min(5, total)
     for i in range(show_n):
         row = lt.lexicon_data[i]
         text = lt._extract_text_from_row(row).strip()
-        ids_no_comp = tokenizer.encode(text, add_special_tokens=False)
         ids_with_comp = all_ids_with_comp[i]
 
         print(f"Entry {i+1}")
-        print(f"  Extracted text: '{text}'")
-        print(f"  IDs (no [COMP]): {ids_no_comp}")
-        print(f"  Decode(no [COMP], skip_special=True):  '{tokenizer.decode(ids_no_comp, skip_special_tokens=True)}'")
-        print(f"  Decode(no [COMP], skip_special=False): '{tokenizer.decode(ids_no_comp, skip_special_tokens=False)}'")
-        print(f"  IDs (with [COMP] first): {ids_with_comp}")
-        print(f"  Decode(with [COMP], skip_special=True):  '{tokenizer.decode(ids_with_comp, skip_special_tokens=True)}'")
-        print(f"  Decode(with [COMP], skip_special=False): '{tokenizer.decode(ids_with_comp, skip_special_tokens=False)}'")
+        print(f"  Original text: '{text}'")
+        print(f"  Encoded IDs: {ids_with_comp}")
+        print(f"  Decoded:  '{tokenizer.decode(ids_with_comp, skip_special_tokens=True)}'")
         print("-" * 80)
+
 
 if __name__ == "__main__":
     main()
