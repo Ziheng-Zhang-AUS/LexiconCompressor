@@ -159,109 +159,87 @@ class RowColumnAttention(nn.Module):
         self.column_attention_layer.load_state_dict(col_weights)
 
     def forward(
-        self,
-        learned_tokens: torch.Tensor,  # (batch_size, num_learned_tokens, hidden_size)
-        dict_tokens: List[torch.Tensor],  # List of tensors, each (seq_len, hidden_size)
-        row_attention_mask: Optional[torch.Tensor] = None,
-        column_attention_mask: Optional[torch.Tensor] = None,
-        row_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        column_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ):
-        """
-        Args:
-            learned_tokens: (batch_size, num_learned_tokens, hidden_size)
-            dict_tokens: List of tensors, length = batch_size, each tensor (seq_len, hidden_size)
+    self,
+    learned_tokens: torch.Tensor,        # (B, T, H)
+    dict_tokens: List[torch.Tensor],     # len=B, each (Li, H)
+    row_attention_mask: Optional[torch.Tensor] = None,
+    column_attention_mask: Optional[torch.Tensor] = None,
+    row_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    column_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+):
 
-        Returns:
-            updated_learned_tokens: (batch_size, num_learned_tokens, hidden_size)  
-            updated_dict_tokens: List of tensors, same structure as input dict_tokens
-        """
-        
-        batch_size, num_learned_tokens, hidden_size = learned_tokens.shape
-        
-        # Record original lengths
-        original_dict_lengths = [seq.shape[0] for seq in dict_tokens]
-        
-        # For each dict sequence, combine with learned_tokens
-        combined_sequences = []
-        combined_masks = []
-        
-        for batch_idx, dict_seq in enumerate(dict_tokens):
-            dict_len = dict_seq.shape[0]
-            
-            # Combine learned tokens with dict sequence based on prepend setting
-            if self.config.learned_tokens_prepend:
-                # learned_tokens first: [learned_tokens, dict_tokens]
-                combined_seq = torch.cat([learned_tokens[batch_idx], dict_seq], dim=0)
-            else:
-                # dict_tokens first: [dict_tokens, learned_tokens]
-                combined_seq = torch.cat([dict_seq, learned_tokens[batch_idx]], dim=0)
-            
-            combined_sequences.append(combined_seq)
-        
-        # Pad all sequences to same length
-        padded_sequences = pad_sequence(combined_sequences, batch_first=True, padding_value=0)  # (batch_size, max_seq_len, hidden_size)
-        max_len = padded_sequences.shape[1]
+        B, T, H = learned_tokens.shape
+        device = learned_tokens.device
 
-        # Create attention mask
+        dict_lens = torch.tensor([seq.size(0) for seq in dict_tokens],
+                                device=device, dtype=torch.long)  # (B,)
+
+        dict_padded = pad_sequence(dict_tokens, batch_first=True, padding_value=0.0)  # (B, Ld_max, H)
+
+        if self.config.learned_tokens_prepend:
+            padded_sequences = torch.cat([learned_tokens, dict_padded], dim=1)  # (B, T+Ld_max, H)
+        else:
+            padded_sequences = torch.cat([dict_padded, learned_tokens], dim=1)  # (B, Ld_max+T, H)
+
+        Lmax = padded_sequences.size(1)
+
         if row_attention_mask is None:
-            row_attention_mask = torch.zeros(batch_size, max_len, device=learned_tokens.device)
-            for i, seq in enumerate(combined_sequences):
-                seq_len = seq.shape[0]
-                row_attention_mask[i, :seq_len] = 1
+            lengths = dict_lens + T  # (B,)
+            row_attention_mask = (
+                torch.arange(Lmax, device=device).unsqueeze(0).expand(B, -1)
+                < lengths.unsqueeze(1)
+            ).to(padded_sequences.dtype)  # (B, Lmax)
 
-        
-        # Position IDs
-        position_ids = torch.arange(max_len, device=padded_sequences.device).unsqueeze(0).expand(batch_size, -1)
-        
-        # Row attention processing
+        position_ids = torch.arange(Lmax, device=device).unsqueeze(0).expand(B, -1)  # (B, Lmax)
+
         row_outputs = self.row_attention_layer(
             hidden_states=padded_sequences,
             attention_mask=row_attention_mask,
             position_ids=position_ids,
             position_embeddings=row_position_embeddings
         )
-        
-        row_processed = row_outputs  # (batch_size, max_seq_len, hidden_size)
-        
-        # Extract updated learned tokens for column attention
-        extracted_learned_tokens = []
-        extracted_dict_tokens = []
-        
-        for batch_idx in range(batch_size):
-            seq_len = combined_sequences[batch_idx].shape[0]
-            
-            if self.config.learned_tokens_prepend:
-                # Learned tokens are at the beginning
-                extracted_learned_token = row_processed[batch_idx, :num_learned_tokens, :]  # (num_learned_tokens, hidden_size)
-                extracted_dict_token = row_processed[batch_idx, num_learned_tokens:seq_len, :] # (dict_len, hidden_size)
-            else:
-                # Learned tokens are at the end
-                dict_len = original_dict_lengths[batch_idx]
-                extracted_learned_token = row_processed[batch_idx, dict_len:seq_len, :]  # (num_learned_tokens, hidden_size)
-                extracted_dict_token = row_processed[batch_idx, :dict_len, :] # (dict_len, hidden_size)
-            
-            extracted_learned_tokens.append(extracted_learned_token)
-            extracted_dict_tokens.append(extracted_dict_token)
-        
-        # Prepare for column attention
-        column_input = torch.stack(extracted_learned_tokens, dim=0)  # (batch_size, num_learned_tokens, hidden_size)
-        
-        # Column attention
-        col_position_ids = torch.arange(column_input.shape[1], device=column_input.device).unsqueeze(0)
+        if isinstance(row_outputs, torch.Tensor):
+            row_processed = row_outputs  # (B, Lmax, H)
+        elif isinstance(row_outputs, (tuple, list)):
+            row_processed = row_outputs[0]
+        else:
+            row_processed = getattr(row_outputs, "last_hidden_state", None)
 
-        # Create column_attention_mask
+        if self.config.learned_tokens_prepend:
+            extracted_learned_tokens = row_processed[:, :T, :]  # (B, T, H)
+            start_for_dict = T
+        else:
+            pos = dict_lens.unsqueeze(1) + torch.arange(T, device=device).unsqueeze(0)  # (B, T)
+            idx = pos.unsqueeze(-1).expand(B, T, H)                                     # (B, T, H)
+            extracted_learned_tokens = torch.gather(row_processed, dim=1, index=idx)   # (B, T, H)
+            start_for_dict = 0
+
+        offs = torch.arange(Lmax, device=device).unsqueeze(0).expand(B, -1)             # (B, Lmax)
+        valid = (offs >= start_for_dict) & (offs < start_for_dict + dict_lens.unsqueeze(1))  # (B, Lmax)
+
+        flat = row_processed[valid]                                                     # (sum(dict_lens), H)
+        extracted_dict_tokens = list(torch.split(flat, dict_lens.tolist(), dim=0))      # len=B, each (Li, H)
+
+        column_input = extracted_learned_tokens  # (B, T, H)
+
+        col_position_ids = torch.arange(T, device=column_input.device).unsqueeze(0)     # (1, T)
+
         if column_attention_mask is None:
-            batch_size, num_learned_tokens, _ = column_input.shape
-            column_attention_mask = torch.ones(batch_size, num_learned_tokens, device=column_input.device)
-            
-        col_output = self.column_attention_layer(
+            column_attention_mask = torch.ones(B, T, device=column_input.device, dtype=column_input.dtype)  # (B, T)
+
+        col_outputs = self.column_attention_layer(
             hidden_states=column_input,
             attention_mask=column_attention_mask,
             position_ids=col_position_ids,
             position_embeddings=column_position_embeddings
         )
-        
+        if isinstance(col_outputs, torch.Tensor):
+            col_output = col_outputs  # (B, T, H)
+        elif isinstance(col_outputs, (tuple, list)):
+            col_output = col_outputs[0]
+        else:
+            col_output = getattr(col_outputs, "last_hidden_state", None)
+
         return col_output, extracted_dict_tokens
 
 if __name__ == "__main__":
