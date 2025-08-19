@@ -242,139 +242,108 @@ class RowColumnAttention(nn.Module):
 
         return col_output, extracted_dict_tokens
 
+
 if __name__ == "__main__":
     import torch
     from transformers import Qwen3Config, Qwen3ForCausalLM
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
     from configuration_lexicon_compressor import LexiconCompressorConfig
 
-    USE_CUSTOM_ROPE = True  # 自喂 RoPE (B,L,head_dim)
+    USE_CUSTOM_ROPE = True  # True: explicitly pass RoPE (B,L,Dh); False: rely on position_ids
 
-    def build_batched_rope(rotary, position_ids: torch.LongTensor, head_dim: int, device):
-        """
-        position_ids: (B, L)
-        return cos/sin: (B, L, head_dim)
-        """
+    def build_batched_rope(rotary, position_ids: torch.LongTensor, head_dim: int, device, dtype):
+        # position_ids: (B,L) -> cos,sin: (B,L,head_dim)
         B, L = position_ids.shape
-        dummy = torch.ones(B, L, head_dim, device=device)
+        dummy = torch.ones(B, L, head_dim, device=device, dtype=dtype)
         cos, sin = rotary(dummy, position_ids)
-        return cos, sin
+        return cos.to(dtype), sin.to(dtype)
 
     print("Testing RowColumnAttention...")
+
+    # ---- Load Qwen3 config ----
     try:
-        print("Load Qwen3 Model and Config...")
-        try:
-            qwen_model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
-            qwen_config = qwen_model.config
-            hidden_size = qwen_config.hidden_size
-            num_heads   = qwen_config.num_attention_heads
-            head_dim    = hidden_size // num_heads
-            rotary_emb  = qwen_model.model.rotary_emb
-            print("Success: Load Qwen3 Model and Config")
-        except Exception as e:
-            print(f"Failed to Load Qwen3 Model and Config: {e}")
-            print("Use Fake Config instead...")
-            qwen_config = Qwen3Config(
-                vocab_size=32000,
-                hidden_size=1024,
-                num_attention_heads=16,
-                num_key_value_heads=8,
-                num_hidden_layers=24,
-                intermediate_size=2048,
-                max_position_embeddings=32768,
-                rope_theta=10000.0
-            )
-            hidden_size = qwen_config.hidden_size
-            num_heads   = qwen_config.num_attention_heads
-            head_dim    = hidden_size // num_heads
-            rotary_emb  = Qwen3RotaryEmbedding(qwen_config)
-
-        # --- 创建模块 ---
-        config = LexiconCompressorConfig(qwen_config=qwen_config)
-        config.learned_tokens_prepend = True
-        processor = RowColumnAttention(config)
-        print("RowColumnAttention Created...")
-
-        # --- 测试数据 ---
-        B = 3
-        num_learned_tokens = 2
-        learned_tokens = torch.randn(B, num_learned_tokens, hidden_size)
-        dict_tokens = [
-            torch.randn(4, hidden_size),  # b0
-            torch.randn(3, hidden_size),  # b1
-            torch.randn(5, hidden_size),  # b2
-        ]
-        device = learned_tokens.device
-        print(f"Test Data Prepared (Device: {device})")
-        print(f"   - Learned Tokens: {learned_tokens.shape}")
-        print(f"   - Dict Token Lengths: {[t.shape[0] for t in dict_tokens]}")
-
-        # --- 行维度的 pad 长度 ---
-        combined_lengths = [t.shape[0] + num_learned_tokens for t in dict_tokens]
-        L_row_max = max(combined_lengths)
-
-        # --- position_ids ---
-        row_position_ids = torch.arange(L_row_max, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)  # (B, L_row_max)
-        N = num_learned_tokens
-        col_position_ids = torch.arange(N, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)          # (B, N)
-
-        # --- 自喂 RoPE (B,L,head_dim) ---
-        if USE_CUSTOM_ROPE:
-            row_cos, row_sin = build_batched_rope(rotary_emb, row_position_ids, head_dim, device)
-            col_cos, col_sin = build_batched_rope(rotary_emb, col_position_ids, head_dim, device)
-            row_position_embeddings = (row_cos, row_sin)         # (B, L_row_max, D_head)
-            column_position_embeddings = (col_cos, col_sin)      # (B, N, D_head)
-            print(f"   - Row RoPE: {[x.shape for x in row_position_embeddings]}")
-            print(f"   - Column RoPE: {[x.shape for x in column_position_embeddings]}")
-        else:
-            row_position_embeddings = None
-            column_position_embeddings = None
-            print("   - Using built-in RoPE with position_ids only")
-
-        # --- 显式 4D attention mask，避免广播问题 ---
-        # 行注意力：键长 = 序列长 = L_row_max
-        # 先做 key padding：True=有效
-        key_padding_row = torch.zeros(B, L_row_max, dtype=torch.bool, device=device)
-        for i, seq in enumerate(dict_tokens):
-            seq_len = seq.shape[0] + num_learned_tokens
-            key_padding_row[i, :seq_len] = True
-        # 4D: (B, 1, L, S)，这里 L=S=L_row_max；让全部 query 位置都能看到有效 key
-        row_attention_mask = key_padding_row[:, None, None, :].expand(B, 1, L_row_max, L_row_max)
-
-        # 列注意力：序列只包含 learned tokens，全部有效
-        key_padding_col = torch.ones(B, N, dtype=torch.bool, device=device)
-        column_attention_mask = key_padding_col[:, None, None, :].expand(B, 1, N, N)
-
-        # --- 前向 ---
-        print("Testing Forward Propagation...")
-        try:
-            out_learned, out_dict_list = processor(
-                learned_tokens=learned_tokens,
-                dict_tokens=dict_tokens,
-                row_attention_mask=row_attention_mask,               # (B,1,L,S)
-                column_attention_mask=column_attention_mask,         # (B,1,N,N)
-                row_position_embeddings=row_position_embeddings,     # (B,L,D_head) 或 None
-                column_position_embeddings=column_position_embeddings
-            )
-
-            if isinstance(out_learned, (tuple, list)):
-                out_learned = out_learned[0]
-
-            print("Success: Forward Propagation!")
-            print(f"   - Output Learned Tokens: {out_learned.shape}")            # 期望: (B, N, H)
-            print(f"   - Output Dict Tokens Lens: {[t.shape[0] for t in out_dict_list]}")
-            for i, (inp_dict, out_dict) in enumerate(zip(dict_tokens, out_dict_list)):
-                print(f"   - Dict{i}: {inp_dict.shape} → {out_dict.shape}")
-
-            print("Success: Testing")
-
-        except Exception as e:
-            print(f"Failed to Forward Propagation: {e}")
-            import traceback
-            traceback.print_exc()
-
+        qwen_model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
+        qwen_config = qwen_model.config
+        hidden_size = qwen_config.hidden_size
+        num_heads   = qwen_config.num_attention_heads
+        head_dim    = hidden_size // num_heads
+        rotary_emb  = qwen_model.model.rotary_emb
+        print("Loaded pretrained Qwen3 config")
     except Exception as e:
-        print(f"Failed to Test: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Warning: failed to load pretrained config: {e}")
+        qwen_config = Qwen3Config(
+            vocab_size=32000,
+            hidden_size=512,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            max_position_embeddings=2048,
+            rope_theta=10000.0
+        )
+        hidden_size = qwen_config.hidden_size
+        num_heads   = qwen_config.num_attention_heads
+        head_dim    = hidden_size // num_heads
+        rotary_emb  = Qwen3RotaryEmbedding(qwen_config)
 
+    # ---- Instantiate our module ----
+    config = LexiconCompressorConfig(qwen_config=qwen_config)
+    config.learned_tokens_prepend = True   # test prepend=True case
+    processor = RowColumnAttention(config)
+    print("RowColumnAttention created")
+
+    # ---- Prepare test data ----
+    B = 2
+    N = 3   # num learned tokens
+    dict_lengths = [4, 7]
+    learned_tokens = torch.randn(B, N, hidden_size)
+    dict_tokens = [torch.randn(Li, hidden_size) for Li in dict_lengths]
+    device = learned_tokens.device
+    dtype  = learned_tokens.dtype
+
+    print(f"learned_tokens: {learned_tokens.shape}")
+    print(f"dict tokens lens: {[t.shape for t in dict_tokens]}")
+
+    # ---- Row dimension setup ----
+    L_row = max(l + N for l in dict_lengths)
+    row_position_ids = torch.arange(L_row, device=device).unsqueeze(0).expand(B, -1)  # (B,L_row)
+
+    if USE_CUSTOM_ROPE:
+        row_cos, row_sin = build_batched_rope(rotary_emb, row_position_ids, head_dim, device, dtype)
+        row_position_embeddings = (row_cos, row_sin)  # (B,L_row,Dh)
+    else:
+        row_position_embeddings = None
+
+    # row mask: (B,1,L,S) with 1=keep, 0=mask
+    row_attention_mask = torch.zeros(B, 1, L_row, L_row, device=device, dtype=dtype)
+    for i, Ld in enumerate(dict_lengths):
+        seq_len = Ld + N
+        row_attention_mask[i, 0, :, :seq_len] = 1.0
+
+    # ---- Column dimension setup ----
+    col_position_ids = torch.arange(N, device=device).unsqueeze(0)  # (1,N)
+    if USE_CUSTOM_ROPE:
+        col_cos, col_sin = build_batched_rope(rotary_emb, col_position_ids, head_dim, device, dtype)
+        column_position_embeddings = (col_cos, col_sin)  # (B,N,Dh)
+    else:
+        column_position_embeddings = None
+
+    column_attention_mask = torch.ones(B, 1, N, N, device=device, dtype=dtype)  # (B,1,N,N)
+
+    # ---- Forward ----
+    print("Running forward...")
+    out_learned, out_dict_list = processor(
+        learned_tokens=learned_tokens,
+        dict_tokens=dict_tokens,
+        row_attention_mask=row_attention_mask,
+        column_attention_mask=column_attention_mask,
+        row_position_embeddings=row_position_embeddings,
+        column_position_embeddings=column_position_embeddings
+    )
+    if isinstance(out_learned, (tuple, list)):
+        out_learned = out_learned[0]
+
+    # ---- Check results ----
+    print(f"Output learned: {out_learned.shape}")         # (B,N,H)
+    for i, (inp, out) in enumerate(zip(dict_tokens, out_dict_list)):
+        print(f"dict{i}: {inp.shape} -> {out.shape}")
