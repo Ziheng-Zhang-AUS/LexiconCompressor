@@ -13,25 +13,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from configuration_lexicon_compressor import LexiconCompressorConfig
 
 
-def _last_hidden(x):
-    """
-    Extract last_hidden_state from Qwen3DecoderLayer outputs.
-
-    Args:
-        x: Tensor or ModelOutput or tuple returned by Qwen3DecoderLayer
-
-    Returns:
-        torch.Tensor: last hidden states
-    """
-    if isinstance(x, torch.Tensor):
-        return x
-    if hasattr(x, "last_hidden_state"):
-        return x.last_hidden_state
-    if isinstance(x, (tuple, list)) and len(x) > 0:
-        return x[0]
-    raise ValueError("Unexpected output type from Qwen3DecoderLayer.forward().")
-
-
 class RowColumnAttention(nn.Module):
     """
     One row-column attention block.
@@ -259,7 +240,7 @@ class RowColumnAttention(nn.Module):
             past_key_values=None,
             use_cache=False,
         )
-        row_out = _last_hidden(row_out)          # (B, Lmax, H)
+        # row_out = _last_hidden(row_out)          # (B, Lmax, H)
 
         idx = (learned_beg.unsqueeze(1) + torch.arange(T, device=device).unsqueeze(0)).unsqueeze(-1).expand(B, T, H)
         updated_learned = torch.gather(row_out, dim=1, index=idx)  # (B, T, H)
@@ -276,7 +257,8 @@ class RowColumnAttention(nn.Module):
             past_key_values=None,
             use_cache=False,
         )
-        updated_learned = _last_hidden(col_out)  # (B, T, H)
+        # updated_learned = _last_hidden(col_out)  # (B, T, H)
+        updated_learned = col_out
 
         return updated_learned, updated_dict_list
     
