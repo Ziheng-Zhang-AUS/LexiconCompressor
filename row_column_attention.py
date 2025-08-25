@@ -1,349 +1,542 @@
-# # row_column_attention: Use @Qwen
-# import torch
-# import torch.nn as nn
-# from typing import List, Optional, Tuple, Dict
-# from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3Config, Qwen3RotaryEmbedding
+# row_column_attention.py
+from __future__ import annotations
+from typing import List, Optional, Tuple, Dict, Any
 
-# class RowColumnAttention(nn.Module):
-#     def __init__(self, config: Qwen3Config):
-#         """
-#         Initialize row and column attention module.
-
-#         Args:
-#             config: Qwen3Config
-#         """
-#         super().__init__()
-#         self.config = config
-#         self.row_attention_layer = Qwen3DecoderLayer(config=config, layer_idx=0)
-#         self.column_attention_layer = Qwen3DecoderLayer(config=config, layer_idx=1)
-#         self._weights_loaded = False
-
-#     def load_weights_once(self, row_weights: Dict, col_weights: Dict):
-#         """
-#         Load weights for the decoder layer(Class: Qwen3DecoderLayer) of row attention and column attention.
-
-#         Args:
-#             row_weights: decoder layer weights of row attention part
-#             column_weights: decoder layer weights of column attention part
-#         """
-#         self.row_attention_layer.load_state_dict(row_weights)
-#         self.column_attention_layer.load_state_dict(col_weights)
-#         self._weights_loaded = True
-
-#     def forward(
-#         self,
-#         embedded_rows: List[torch.Tensor],
-#         row_attention_mask: Optional[List[torch.Tensor]] = None,
-#         column_attention_mask: Optional[torch.Tensor] = None,
-#         row_position_embeddings: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-#         column_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-#         row_layer_weights: Optional[Dict[str, torch.Tensor]] = None,
-#         col_layer_weights: Optional[Dict[str, torch.Tensor]] = None
-#     ):
-#         """
-#         Args:
-#             embedded_rows: Hidden state of the dictionary. Each element representing a row of the dictionary, with shape of (seq_len, hidden_size). The first element should be compress token instead.
-
-#             row_attention_mask: Attention mask of each row, which should be ones tensor. 
-
-#             column_attention_mask: Attention mask of the first column(compress token).
-
-#             row_position_embeddings: RoPE of each row, which should have position info, because the tokens within a row are order sensitive.
-
-#             column_position_embeddings: RoPE of the first column, which should not have position info, because the compress tokens are not order sensitive.
-
-#             row_layer_weights: Weights should be loaded for the decoder layer of row attention.
-
-#             column_layer_weights: Weights should be loaded for the decoder layer of column attention.
-
-#         """
-        
-#         # for k, row_embed in enumerate(embedded_rows):
-#         # print(f">>> row[{k}].device =", row_embed.device)
-#         # print(">>> row_layernorm.weight.device =", self.row_attention_layer.input_layernorm.weight.device)
-
-#         if not self._weights_loaded:
-#             if row_layer_weights is None:
-#                 raise ValueError("Qwen3DecoderLayer weights should be provided for row_attention_layer in param 'row_layer_weights'")
-#             if col_layer_weights is None:
-#                 raise ValueError("Qwen3DecoderLayer weights should be provided for column_attention_layer in param 'col_layer_weights'")
-#             self.load_weights_once(row_layer_weights, col_layer_weights)
-
-#         if row_attention_mask is None:
-#             row_attention_mask = [None] * len(embedded_rows)
-        
-#         if row_position_embeddings is None or column_position_embeddings is None:
-#             raise ValueError("row_position_embeddings and column_position_embeddings must be provided")
-        
-#         if len(row_position_embeddings) != len(embedded_rows):
-#             raise ValueError("The number of row_position_embeddings must be the same as the number of embedded_rows")
-        
-        
-#         processed_rows = []
-#         container_tokens = []
-
-#         for row_embed, row_mask, row_position_embedding in zip(embedded_rows, row_attention_mask, row_position_embeddings):
-#             if row_embed.dim() == 2:
-#                 row_input = row_embed.unsqueeze(0) # shape -> [1, seq_len, hidden_size]
-#             else:
-#                 row_input = row_embed
-
-#             seq_len = row_input.shape[1]
-#             position_ids = torch.arange(seq_len, device=row_input.device).unsqueeze(0)
-
-#             row_output = self.row_attention_layer(
-#                 hidden_states=row_input,
-#                 attention_mask=row_mask,
-#                 position_ids=position_ids,
-#                 position_embeddings=row_position_embedding
-#             )
-
-#             row_output = row_output[0] # QwenDecoderLayer returns a tuple, (hidden_state, attention_weight)
-#             processed_row = row_output.squeeze(0) # shape -> [seq_len, hidden_size]
-#             processed_rows.append(processed_row)
-
-#             container_token = processed_row[0:1] # shape -> [1, hidden_size]
-#             container_tokens.append(container_token)
-        
-#         container_tensor = torch.cat(container_tokens, dim=0)
-#         container_input = container_tensor.unsqueeze(0) # shape -> [1, num_rows, hidden_size]
-#         num_rows = container_input.shape[1]
-#         col_position_ids = torch.arange(num_rows, device=container_input.device).unsqueeze(0)
-
-#         col_output = self.column_attention_layer(
-#             hidden_states=container_input,
-#             attention_mask=column_attention_mask,
-#             position_ids=col_position_ids,
-#             position_embeddings=column_position_embeddings
-#         )
-#         col_output = col_output[0]
-#         final_containers = col_output.squeeze(0) # shape -> [num_rows, hidden_size]
-
-#         updated_rows = []
-#         for i, original_row in enumerate(processed_rows):
-#             updated_row = original_row.clone()
-#             updated_row[0] = final_containers[i]
-#             updated_rows.append(updated_row)
-        
-#         return updated_rows
-
-
-# row_column_attention: Use @Qwen
 import torch
 import torch.nn as nn
-from typing import List, Optional, Tuple, Dict
-from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 from torch.nn.utils.rnn import pad_sequence
+
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3DecoderLayer,
+    Qwen3RotaryEmbedding,
+)
 from configuration_lexicon_compressor import LexiconCompressorConfig
 
+
+def _last_hidden(x):
+    """
+    Extract last_hidden_state from Qwen3DecoderLayer outputs.
+
+    Args:
+        x: Tensor or ModelOutput or tuple returned by Qwen3DecoderLayer
+
+    Returns:
+        torch.Tensor: last hidden states
+    """
+    if isinstance(x, torch.Tensor):
+        return x
+    if hasattr(x, "last_hidden_state"):
+        return x.last_hidden_state
+    if isinstance(x, (tuple, list)) and len(x) > 0:
+        return x[0]
+    raise ValueError("Unexpected output type from Qwen3DecoderLayer.forward().")
+
+
 class RowColumnAttention(nn.Module):
+    """
+    One row-column attention block.
+
+    Row pass: self-attention over per-row sequences after concatenation and right padding.
+    Column pass: self-attention over learned (compressed) tokens with identity RoPE.
+
+    Inputs:
+        learned_tokens: (B, T, H)
+        dict_tokens_list: List[(Li, H)] of length B
+
+    Outputs:
+        updated_learned: (B, T, H)
+        updated_dict_list: List[(Li, H)] of length B
+    """
+
     def __init__(self, config: LexiconCompressorConfig):
         """
-        Initialize row and column attention module.
+        Initialize RowColumnAttention.
+
+        Args:
+            config: LexiconCompressorConfig carrying the underlying Qwen3Config and compressor options
         """
         super().__init__()
         self.config = config
-        self.row_attention_layer = Qwen3DecoderLayer(config=config.qwen_config, layer_idx=0)
-        self.column_attention_layer = Qwen3DecoderLayer(config=config.qwen_config, layer_idx=1)
+        qcfg = config.qwen_config
 
-    def load_weights_once(self, row_weights: Dict, col_weights: Dict):
+        self.hidden_size = qcfg.hidden_size
+        self.row_layer = Qwen3DecoderLayer(config=qcfg, layer_idx=0)
+        self.col_layer = Qwen3DecoderLayer(config=qcfg, layer_idx=1)
+        self.rope = Qwen3RotaryEmbedding(config=qcfg)
+
+        self._weights_loaded = False
+
+    def load_weights_once(self, row_weights: Dict[str, torch.Tensor], col_weights: Dict[str, torch.Tensor]):
         """
-        Load weights for the decoder layers.
+        Load decoder-layer weights once.
+
+        Args:
+            row_weights: state_dict for row decoder layer
+            col_weights: state_dict for column decoder layer
         """
-        if not self._weights_loaded:
-            if row_weights is None:
-                raise ValueError("row_layer_weights required")
-            if col_weights is None:
-                raise ValueError("col_layer_weights required")
-        self.row_attention_layer.load_state_dict(row_weights)
-        self.column_attention_layer.load_state_dict(col_weights)
+        if self._weights_loaded:
+            return
+        if row_weights is None or col_weights is None:
+            raise ValueError("Both row_weights and col_weights must be provided.")
+        self.row_layer.load_state_dict(row_weights, strict=True)
+        self.col_layer.load_state_dict(col_weights, strict=True)
+        self._weights_loaded = True
+
+    @staticmethod
+    def _concat_then_right_pad(
+        learned: torch.Tensor,
+        dict_list: List[torch.Tensor],
+        prepend: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Concatenate per row then right-pad to batch.
+
+        Args:
+            learned: (B, T, H)
+            dict_list: list of per-row tensors, each (Li, H)
+            prepend: if True, learned precedes dict; else dict precedes learned
+
+        Returns:
+            padded: (B, Lmax, H)
+            total_lens: (B,)
+            learned_beg: (B,)
+            dict_beg: (B,)
+        """
+        B, T, H = learned.shape
+        concat_rows, total_lens, learned_beg, dict_beg = [], [], [], []
+        for i in range(B):
+            Li = dict_list[i].size(0)
+            if prepend:
+                row = torch.cat([learned[i], dict_list[i]], dim=0)  # (T+Li, H)
+                learned_beg.append(0)
+                dict_beg.append(T)
+            else:
+                row = torch.cat([dict_list[i], learned[i]], dim=0)  # (Li+T, H)
+                learned_beg.append(Li)
+                dict_beg.append(0)
+            concat_rows.append(row)
+            total_lens.append(row.size(0))
+        padded = pad_sequence(concat_rows, batch_first=True, padding_value=0.0)  # (B, Lmax, H)
+        total_lens = torch.tensor(total_lens, device=learned.device, dtype=torch.long)  # (B,)
+        learned_beg = torch.tensor(learned_beg, device=learned.device, dtype=torch.long)  # (B,)
+        dict_beg = torch.tensor(dict_beg, device=learned.device, dtype=torch.long)  # (B,)
+        return padded, total_lens, learned_beg, dict_beg
+
+    def _build_row_mask_and_rope(
+        self,
+        total_lens: torch.Tensor,
+        Lmax: int,
+        prepend: bool,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Build additive attention mask and RoPE for row pass.
+
+        Args:
+            total_lens: (B,)
+            Lmax: int, max padded length
+            prepend: whether learned tokens are placed before dict tokens
+            dtype: torch dtype
+            device: torch device
+
+        Returns:
+            mask: (B, 1, Lmax, Lmax)
+            rope: tuple(cos, sin) where each is (B, Lmax, head_dim)
+        """
+        B = total_lens.size(0)
+        k_range = torch.arange(Lmax, device=device).unsqueeze(0).expand(B, -1)  # (B, Lmax)
+        key_valid_1d = (k_range < total_lens.unsqueeze(1))  # (B, Lmax)
+
+        mask = torch.zeros(B, 1, Lmax, Lmax, device=device, dtype=dtype)  # (B, 1, Lmax, Lmax)
+        neg_inf = torch.finfo(dtype).min
+        key_valid_4d = key_valid_1d.view(B, 1, 1, Lmax).expand(B, 1, Lmax, Lmax)  # (B,1,Lmax,Lmax)
+        mask = torch.where(key_valid_4d, mask, torch.tensor(neg_inf, device=device, dtype=dtype))
+        if not prepend:
+            causal = torch.tril(torch.ones(Lmax, Lmax, device=device, dtype=torch.bool)).view(1, 1, Lmax, Lmax)
+            mask = torch.where(causal, mask, torch.tensor(neg_inf, device=device, dtype=dtype))
+
+        pos_ids = torch.zeros(B, Lmax, device=device, dtype=torch.long)  # (B, Lmax)
+        for b in range(B):
+            Lb = total_lens[b].item()
+            if Lb > 0:
+                pos_ids[b, :Lb] = torch.arange(Lb, device=device, dtype=torch.long)
+
+        dummy = torch.empty(B, Lmax, self.hidden_size, device=device, dtype=dtype)  # (B, Lmax, H)
+        cos, sin = self.rope(dummy, pos_ids)  # (B, Lmax, head_dim)
+        return mask, (cos, sin)
+
+    @staticmethod
+    def _slice_back_to_list(
+        row_out: torch.Tensor,
+        dict_lens: torch.Tensor,
+        dict_beg: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        """
+        Slice updated dict segments back into a list.
+
+        Args:
+            row_out: (B, Lmax, H)
+            dict_lens: (B,)
+            dict_beg: (B,)
+
+        Returns:
+            list of tensors, each (Li, H)
+        """
+        B, Lmax, H = row_out.shape
+        out_list: List[torch.Tensor] = []
+        for b in range(B):
+            beg = dict_beg[b].item()
+            Li = dict_lens[b].item()
+            out_list.append(row_out[b, beg:beg + Li, :])
+        return out_list
+
+    def _identity_rope(
+        self,
+        B: int,
+        T: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build identity RoPE for column pass.
+
+        Args:
+            B: batch size
+            T: number of learned tokens
+            dtype: torch dtype
+            device: torch device
+
+        Returns:
+            tuple(cos, sin) where cos=1 and sin=0, each (B, T, head_dim)
+        """
+        dummy = torch.empty(B, T, self.hidden_size, device=device, dtype=dtype)  # (B, T, H)
+        cos_ref, _ = self.rope(dummy, torch.arange(T, device=device).unsqueeze(0).expand(B, -1))  # (B,T,head_dim)
+        head_dim = cos_ref.size(-1)
+        cos = torch.ones(B, T, head_dim, device=device, dtype=dtype)  # (B, T, head_dim)
+        sin = torch.zeros(B, T, head_dim, device=device, dtype=dtype)  # (B, T, head_dim)
+        return cos, sin
 
     def forward(
-    self,
-    learned_tokens: torch.Tensor,        # (B, T, H)
-    dict_tokens: List[torch.Tensor],     # len=B, each (Li, H)
-    row_attention_mask: Optional[torch.Tensor] = None,
-    column_attention_mask: Optional[torch.Tensor] = None,
-    row_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    column_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-):
+        self,
+        learned_tokens: torch.Tensor,
+        dict_tokens_list: List[torch.Tensor],
+        **_: Any,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Forward pass.
+
+        Args:
+            learned_tokens: (B, T, H)
+            dict_tokens_list: list of per-row tensors, each (Li, H)
+
+        Returns:
+            updated_learned: (B, T, H)
+            updated_dict_list: List[(Li, H)]
+        """
+        if len(dict_tokens_list) != learned_tokens.size(0):
+            raise ValueError("Batch size mismatch between learned_tokens and dict_tokens_list")
 
         B, T, H = learned_tokens.shape
-        device = learned_tokens.device
+        device, dtype = learned_tokens.device, learned_tokens.dtype
+        dict_lens = torch.tensor([t.size(0) for t in dict_tokens_list], device=device, dtype=torch.long)  # (B,)
 
-        dict_lens = torch.tensor([seq.size(0) for seq in dict_tokens],
-                                device=device, dtype=torch.long)  # (B,)
+        prepend = bool(self.config.learned_tokens_prepend)
+        row_padded, total_lens, learned_beg, dict_beg = self._concat_then_right_pad(
+            learned=learned_tokens, dict_list=dict_tokens_list, prepend=prepend
+        )  # (B, Lmax, H), (B,), (B,), (B,)
+        Lmax = row_padded.size(1)
 
-        dict_padded = pad_sequence(dict_tokens, batch_first=True, padding_value=0.0)  # (B, Ld_max, H)
-
-        if self.config.learned_tokens_prepend:
-            padded_sequences = torch.cat([learned_tokens, dict_padded], dim=1)  # (B, T+Ld_max, H)
-        else:
-            padded_sequences = torch.cat([dict_padded, learned_tokens], dim=1)  # (B, Ld_max+T, H)
-
-        Lmax = padded_sequences.size(1)
-
-        if row_attention_mask is None:
-            lengths = dict_lens + T  # (B,)
-            row_attention_mask = (
-                torch.arange(Lmax, device=device).unsqueeze(0).expand(B, -1)
-                < lengths.unsqueeze(1)
-            ).to(padded_sequences.dtype)  # (B, Lmax)
-
-        position_ids = torch.arange(Lmax, device=device).unsqueeze(0).expand(B, -1)  # (B, Lmax)
-
-        row_outputs = self.row_attention_layer(
-            hidden_states=padded_sequences,
-            attention_mask=row_attention_mask,
-            position_ids=position_ids,
-            position_embeddings=row_position_embeddings
+        row_mask, row_rope = self._build_row_mask_and_rope(
+            total_lens=total_lens, Lmax=Lmax, prepend=prepend, dtype=dtype, device=device
         )
-        if isinstance(row_outputs, torch.Tensor):
-            row_processed = row_outputs  # (B, Lmax, H)
-        elif isinstance(row_outputs, (tuple, list)):
-            row_processed = row_outputs[0]
-        else:
-            row_processed = getattr(row_outputs, "last_hidden_state", None)
 
-        if self.config.learned_tokens_prepend:
-            extracted_learned_tokens = row_processed[:, :T, :]  # (B, T, H)
-            start_for_dict = T
-        else:
-            pos = dict_lens.unsqueeze(1) + torch.arange(T, device=device).unsqueeze(0)  # (B, T)
-            idx = pos.unsqueeze(-1).expand(B, T, H)                                     # (B, T, H)
-            extracted_learned_tokens = torch.gather(row_processed, dim=1, index=idx)   # (B, T, H)
-            start_for_dict = 0
-
-        offs = torch.arange(Lmax, device=device).unsqueeze(0).expand(B, -1)             # (B, Lmax)
-        valid = (offs >= start_for_dict) & (offs < start_for_dict + dict_lens.unsqueeze(1))  # (B, Lmax)
-
-        flat = row_processed[valid]                                                     # (sum(dict_lens), H)
-        extracted_dict_tokens = list(torch.split(flat, dict_lens.tolist(), dim=0))      # len=B, each (Li, H)
-
-        column_input = extracted_learned_tokens  # (B, T, H)
-
-        col_position_ids = torch.arange(T, device=column_input.device).unsqueeze(0)     # (1, T)
-
-        if column_attention_mask is None:
-            column_attention_mask = torch.ones(B, T, device=column_input.device, dtype=column_input.dtype)  # (B, T)
-
-        col_outputs = self.column_attention_layer(
-            hidden_states=column_input,
-            attention_mask=column_attention_mask,
-            position_ids=col_position_ids,
-            position_embeddings=column_position_embeddings
+        row_out = self.row_layer(
+            hidden_states=row_padded,            # (B, Lmax, H)
+            attention_mask=row_mask,             # (B, 1, Lmax, Lmax)
+            position_ids=None,
+            position_embeddings=row_rope,        # (cos, sin)
+            past_key_values=None,
+            use_cache=False,
         )
-        if isinstance(col_outputs, torch.Tensor):
-            col_output = col_outputs  # (B, T, H)
-        elif isinstance(col_outputs, (tuple, list)):
-            col_output = col_outputs[0]
-        else:
-            col_output = getattr(col_outputs, "last_hidden_state", None)
+        row_out = _last_hidden(row_out)          # (B, Lmax, H)
 
-        return col_output, extracted_dict_tokens
+        idx = (learned_beg.unsqueeze(1) + torch.arange(T, device=device).unsqueeze(0)).unsqueeze(-1).expand(B, T, H)
+        updated_learned = torch.gather(row_out, dim=1, index=idx)  # (B, T, H)
+        updated_dict_list = self._slice_back_to_list(row_out, dict_lens=dict_lens, dict_beg=dict_beg)
 
+        col_mask = torch.zeros(B, 1, T, T, device=device, dtype=dtype)  # (B, 1, T, T)
+        col_rope = self._identity_rope(B=B, T=T, dtype=dtype, device=device)
+
+        col_out = self.col_layer(
+            hidden_states=updated_learned,       # (B, T, H)
+            attention_mask=col_mask,             # (B, 1, T, T)
+            position_ids=None,
+            position_embeddings=col_rope,        # (cos=1, sin=0)
+            past_key_values=None,
+            use_cache=False,
+        )
+        updated_learned = _last_hidden(col_out)  # (B, T, H)
+
+        return updated_learned, updated_dict_list
+    
+    
+    
+    
+# test_row_column_attention.py
+"""
+Test script for RowColumnAttention module using real Qwen3-0.6B configuration.
+"""
+
+import torch
+import torch.nn as nn
+from transformers import Qwen3Config
+from configuration_lexicon_compressor import LexiconCompressorConfig
+from row_column_attention import RowColumnAttention
+
+def create_valid_qwen_config():
+    """
+    Create a valid Qwen3 configuration that works with RowColumnAttention.
+    """
+    # Load base config
+    config = Qwen3Config.from_pretrained("Qwen/Qwen3-0.6B")
+    
+    # Set attention implementation
+    config._attn_implementation = "eager"
+    
+    # Ensure all required parameters are set properly
+    if not hasattr(config, 'sliding_window') or config.sliding_window is None:
+        config.sliding_window = 4096
+    
+    return config
+
+def test_row_column_attention():
+    """
+    Test basic functionality of RowColumnAttention with real Qwen3-0.6B config.
+    """
+    
+    # 1. Load real Qwen3-0.6B configuration from HuggingFace
+    print("Loading real Qwen3-0.6B configuration...")
+    qwen_config = create_valid_qwen_config()
+    
+    print(f"Loaded Qwen3 config: hidden_size={qwen_config.hidden_size}, num_heads={qwen_config.num_attention_heads}")
+    print(f"Attention implementation: {qwen_config._attn_implementation}")
+    
+    # 2. Create compressor configuration
+    compressor_config = LexiconCompressorConfig(
+        qwen_config=qwen_config,
+        num_layers=2,
+        num_compress_tokens=4,
+        learned_tokens_prepend=True,  # Test prepend mode
+    )
+    
+    # 3. Create model
+    rca = RowColumnAttention(compressor_config)
+    
+    # 4. Prepare test data
+    B = 3  # batch size
+    T = 4  # compress tokens per row
+    H = qwen_config.hidden_size  # hidden size from real config
+    
+    # learned tokens: (B, T, H)
+    learned_tokens = torch.randn(B, T, H)
+    
+    # dict tokens: List of (Li, H)
+    dict_tokens_list = [
+        torch.randn(5, H),   # Row 1, length 5
+        torch.randn(3, H),   # Row 2, length 3
+        torch.randn(7, H),   # Row 3, length 7
+    ]
+    
+    print("=== Test Data ===")
+    print(f"learned_tokens shape: {learned_tokens.shape}")
+    print(f"dict_tokens_list lengths: {[t.shape[0] for t in dict_tokens_list]}")
+    
+    # 5. Forward pass
+    print("\n=== Forward Pass Test ===")
+    try:
+        updated_learned, updated_dict_list = rca(
+            learned_tokens=learned_tokens,
+            dict_tokens_list=dict_tokens_list
+        )
+        
+        print(f"updated_learned shape: {updated_learned.shape}")
+        print(f"updated_dict_list lengths: {[t.shape[0] for t in updated_dict_list]}")
+        
+        # 6. Verify output shapes
+        assert updated_learned.shape == (B, T, H), f"Expected {(B, T, H)}, got {updated_learned.shape}"
+        assert len(updated_dict_list) == B, f"Expected {B} dict tensors, got {len(updated_dict_list)}"
+        
+        for i, (orig, updated) in enumerate(zip(dict_tokens_list, updated_dict_list)):
+            assert updated.shape == orig.shape, f"Dict tensor {i}: expected {orig.shape}, got {updated.shape}"
+        
+        print("✅ Shape validation passed!")
+        
+        # 7. Verify numerical changes (should not be identical)
+        assert not torch.allclose(updated_learned, learned_tokens), "Learned tokens should be updated"
+        print("✅ Numerical update validation passed!")
+        
+    except Exception as e:
+        print(f"❌ Forward pass failed with error: {e}")
+        raise
+    
+    # 8. Test append mode
+    print("\n=== Test Append Mode ===")
+    compressor_config_append = LexiconCompressorConfig(
+        qwen_config=qwen_config,
+        num_layers=2,
+        num_compress_tokens=4,
+        learned_tokens_prepend=False,  # append mode
+    )
+    
+    rca_append = RowColumnAttention(compressor_config_append)
+    
+    try:
+        updated_learned_append, updated_dict_list_append = rca_append(
+            learned_tokens=learned_tokens,
+            dict_tokens_list=dict_tokens_list
+        )
+        
+        assert updated_learned_append.shape == (B, T, H)
+        assert len(updated_dict_list_append) == B
+        print("✅ Append mode test passed!")
+        
+    except Exception as e:
+        print(f"❌ Append mode test failed with error: {e}")
+        raise
+    
+    # 9. Test gradient flow
+    print("\n=== Gradient Flow Test ===")
+    learned_tokens.requires_grad_(True)
+    
+    try:
+        updated_learned, _ = rca(
+            learned_tokens=learned_tokens,
+            dict_tokens_list=dict_tokens_list
+        )
+        
+        loss = updated_learned.sum()
+        loss.backward()
+        
+        assert learned_tokens.grad is not None, "Gradient should flow back to learned_tokens"
+        print("✅ Gradient flow test passed!")
+        
+    except Exception as e:
+        print(f"❌ Gradient flow test failed with error: {e}")
+        raise
+    
+    print("\n🎉 All basic tests passed!")
+
+def test_edge_cases():
+    """
+    Test edge cases for RowColumnAttention.
+    """
+    print("\n=== Edge Cases Test ===")
+    
+    # Load real configuration
+    qwen_config = create_valid_qwen_config()
+    H = qwen_config.hidden_size
+    
+    compressor_config = LexiconCompressorConfig(
+        qwen_config=qwen_config,
+        num_layers=1,
+        num_compress_tokens=2,
+        learned_tokens_prepend=True,
+    )
+    
+    rca = RowColumnAttention(compressor_config)
+    
+    # Test single sample
+    B, T = 1, 2
+    learned_tokens = torch.randn(B, T, H)
+    dict_tokens_list = [torch.randn(10, H)]  # Single long sequence
+    
+    try:
+        updated_learned, updated_dict_list = rca(
+            learned_tokens=learned_tokens,
+            dict_tokens_list=dict_tokens_list
+        )
+        
+        assert updated_learned.shape == (1, 2, H)
+        assert len(updated_dict_list) == 1
+        assert updated_dict_list[0].shape == (10, H)
+        print("✅ Single sample test passed!")
+        
+    except Exception as e:
+        print(f"❌ Single sample test failed with error: {e}")
+        raise
+    
+    # Test short sequences
+    dict_tokens_list_short = [
+        torch.randn(1, H),   # Length 1
+        torch.randn(2, H),   # Length 2
+    ]
+    
+    try:
+        updated_learned, updated_dict_list = rca(
+            learned_tokens=torch.randn(2, T, H),
+            dict_tokens_list=dict_tokens_list_short
+        )
+        
+        assert len(updated_dict_list) == 2
+        assert updated_dict_list[0].shape == (1, H)
+        assert updated_dict_list[1].shape == (2, H)
+        print("✅ Short sequences test passed!")
+        
+    except Exception as e:
+        print(f"❌ Short sequences test failed with error: {e}")
+        raise
+
+def test_consistent_dimensions():
+    """
+    Test with consistent dimensions using the real Qwen3 config without modifications.
+    """
+    print("\n=== Consistent Dimensions Test ===")
+    
+    # Use real Qwen3-0.6B config without modifications
+    qwen_config = create_valid_qwen_config()
+    H = qwen_config.hidden_size
+    
+    compressor_config = LexiconCompressorConfig(
+        qwen_config=qwen_config,
+        num_layers=1,
+        num_compress_tokens=3,
+        learned_tokens_prepend=True,
+    )
+    
+    rca = RowColumnAttention(compressor_config)
+    
+    B, T = 2, 3
+    learned_tokens = torch.randn(B, T, H)
+    dict_tokens_list = [
+        torch.randn(4, H),
+        torch.randn(6, H),
+    ]
+    
+    try:
+        updated_learned, updated_dict_list = rca(
+            learned_tokens=learned_tokens,
+            dict_tokens_list=dict_tokens_list
+        )
+        
+        assert updated_learned.shape == (B, T, H)
+        assert len(updated_dict_list) == B
+        assert updated_dict_list[0].shape == (4, H)
+        assert updated_dict_list[1].shape == (6, H)
+        print("✅ Consistent dimensions test passed!")
+        
+    except Exception as e:
+        print(f"❌ Consistent dimensions test failed with error: {e}")
+        raise
 
 if __name__ == "__main__":
-    import torch
-    from transformers import Qwen3Config, Qwen3ForCausalLM
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-    from configuration_lexicon_compressor import LexiconCompressorConfig
-
-    USE_CUSTOM_ROPE = True  # True: explicitly pass RoPE (B,L,Dh); False: rely on position_ids
-
-    def build_batched_rope(rotary, position_ids: torch.LongTensor, head_dim: int, device, dtype):
-        # position_ids: (B,L) -> cos,sin: (B,L,head_dim)
-        B, L = position_ids.shape
-        dummy = torch.ones(B, L, head_dim, device=device, dtype=dtype)
-        cos, sin = rotary(dummy, position_ids)
-        return cos.to(dtype), sin.to(dtype)
-
-    print("Testing RowColumnAttention...")
-
-    # ---- Load Qwen3 config ----
+    print("🚀 Starting RowColumnAttention tests with real Qwen3-0.6B configuration...")
     try:
-        qwen_model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
-        qwen_config = qwen_model.config
-        hidden_size = qwen_config.hidden_size
-        num_heads   = qwen_config.num_attention_heads
-        head_dim    = hidden_size // num_heads
-        rotary_emb  = qwen_model.model.rotary_emb
-        print("Loaded pretrained Qwen3 config")
+        test_row_column_attention()
+        test_edge_cases()
+        test_consistent_dimensions()
+        print("\n🎊 All tests completed successfully!")
     except Exception as e:
-        print(f"Warning: failed to load pretrained config: {e}")
-        qwen_config = Qwen3Config(
-            vocab_size=32000,
-            hidden_size=512,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            num_hidden_layers=4,
-            intermediate_size=2048,
-            max_position_embeddings=2048,
-            rope_theta=10000.0
-        )
-        hidden_size = qwen_config.hidden_size
-        num_heads   = qwen_config.num_attention_heads
-        head_dim    = hidden_size // num_heads
-        rotary_emb  = Qwen3RotaryEmbedding(qwen_config)
-
-    # ---- Instantiate our module ----
-    config = LexiconCompressorConfig(qwen_config=qwen_config)
-    config.learned_tokens_prepend = True   # test prepend=True case
-    processor = RowColumnAttention(config)
-    print("RowColumnAttention created")
-
-    # ---- Prepare test data ----
-    B = 2
-    N = 3   # num learned tokens
-    dict_lengths = [4, 7]
-    learned_tokens = torch.randn(B, N, hidden_size)
-    dict_tokens = [torch.randn(Li, hidden_size) for Li in dict_lengths]
-    device = learned_tokens.device
-    dtype  = learned_tokens.dtype
-
-    print(f"learned_tokens: {learned_tokens.shape}")
-    print(f"dict tokens lens: {[t.shape for t in dict_tokens]}")
-
-    # ---- Row dimension setup ----
-    L_row = max(l + N for l in dict_lengths)
-    row_position_ids = torch.arange(L_row, device=device).unsqueeze(0).expand(B, -1)  # (B,L_row)
-
-    if USE_CUSTOM_ROPE:
-        row_cos, row_sin = build_batched_rope(rotary_emb, row_position_ids, head_dim, device, dtype)
-        row_position_embeddings = (row_cos, row_sin)  # (B,L_row,Dh)
-    else:
-        row_position_embeddings = None
-
-    # row mask: (B,1,L,S) with 1=keep, 0=mask
-    row_attention_mask = torch.zeros(B, 1, L_row, L_row, device=device, dtype=dtype)
-    for i, Ld in enumerate(dict_lengths):
-        seq_len = Ld + N
-        row_attention_mask[i, 0, :, :seq_len] = 1.0
-
-    # ---- Column dimension setup ----
-    col_position_ids = torch.arange(N, device=device).unsqueeze(0)  # (1,N)
-    if USE_CUSTOM_ROPE:
-        col_cos, col_sin = build_batched_rope(rotary_emb, col_position_ids, head_dim, device, dtype)
-        column_position_embeddings = (col_cos, col_sin)  # (B,N,Dh)
-    else:
-        column_position_embeddings = None
-
-    column_attention_mask = torch.ones(B, 1, N, N, device=device, dtype=dtype)  # (B,1,N,N)
-
-    # ---- Forward ----
-    print("Running forward...")
-    out_learned, out_dict_list = processor(
-        learned_tokens=learned_tokens,
-        dict_tokens=dict_tokens,
-        row_attention_mask=row_attention_mask,
-        column_attention_mask=column_attention_mask,
-        row_position_embeddings=row_position_embeddings,
-        column_position_embeddings=column_position_embeddings
-    )
-    if isinstance(out_learned, (tuple, list)):
-        out_learned = out_learned[0]
-
-    # ---- Check results ----
-    print(f"Output learned: {out_learned.shape}")         # (B,N,H)
-    for i, (inp, out) in enumerate(zip(dict_tokens, out_dict_list)):
-        print(f"dict{i}: {inp.shape} -> {out.shape}")
+        print(f"\n❌ Test failed with error: {e}")
+        import traceback
+        traceback.print_exc()
