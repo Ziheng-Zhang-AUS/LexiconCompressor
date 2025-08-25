@@ -83,7 +83,7 @@ class LexiconCompressorModel(nn.Module):
         )
 
         # Learned tokens for each dictionary row
-        learned = torch.randn(self.num_rows, self.num_compress_tokens, self.hidden_size) * 0.02
+        learned = torch.randn(self.num_rows, self.num_compress_tokens, self.hidden_size)
         self.learned_tokens_global = nn.Parameter(learned)
 
         # Encoder stack
