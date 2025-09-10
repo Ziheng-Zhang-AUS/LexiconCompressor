@@ -21,7 +21,7 @@ class LexiconCompressorTokenizor:
         self.lowercase = lowercase
 
     def tokenize(self) -> List[List[int]]:
-        """Tokenize dictionary entries into list of token IDs."""
+        # Tokenize dictionary entries into list of token ids
         entries = []
         
         with open(self.csv_path, 'r', encoding='utf-8') as f:
