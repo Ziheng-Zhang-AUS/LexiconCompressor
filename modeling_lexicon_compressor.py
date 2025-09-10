@@ -167,52 +167,46 @@ class LexiconCompressorModel(nn.Module):
     # ------------------------------------------------------------------
     def _gather_batch_rows(
         self,
-        row_indices_per_sample: List[List[int]],
+        idx_padded: torch.LongTensor,  # (B, R_sel) with -1 padding
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather rows (vectorized) without Python loops.
+        """
+        Vectorized gather with no Python loops.
 
         Args:
-            row_indices_per_sample: list of row id lists (len B).
+            idx_padded: (B, R_sel) row indices, padded with -1.
 
         Returns:
-            learned: (B, R_sel, T, C)
-            dict_emb: (B, R_sel, L_max, C)
+            learned:       (B, R_sel, T, C)
+            dict_emb:      (B, R_sel, L_max, C)
             dict_pad_mask: (B, R_sel, L_max) bool
-            row_pad_mask: (B, R_sel) bool  # True for padded rows
+            row_pad_mask:  (B, R_sel) bool  # True for padded rows
         """
-        B = len(row_indices_per_sample)
-        R_sel = max((len(r) for r in row_indices_per_sample), default=1)
+        if not torch.is_tensor(idx_padded):
+            raise TypeError("idx_padded must be a padded LongTensor of shape (B, R_sel) with -1 for padding.")
+        if idx_padded.dim() != 2:
+            raise ValueError(f"idx_padded must be 2D (B, R_sel), got shape {tuple(idx_padded.shape)}")
 
-        # Build (B, R_sel) with -1 padding using F.pad
-        padded_index_rows: List[torch.Tensor] = []
-        for r in row_indices_per_sample:
-            t = torch.tensor(r, dtype=torch.long)
-            pad_len = R_sel - t.numel()
-            if pad_len > 0:
-                t = F.pad(t, (0, pad_len), value=-1)
-            padded_index_rows.append(t)
-        idx_padded = torch.stack(padded_index_rows, dim=0).to(self._device())  # (B, R_sel)
-        row_pad_mask = idx_padded.eq(-1)
-        idx_safe = idx_padded.clamp(min=0)
+        idx_padded = idx_padded.to(self._get_device())
+        row_pad_mask = idx_padded.eq(-1)                  # (B, R_sel)
+        idx_safe = idx_padded.clamp(min=0)                # (B, R_sel)
 
-        # Full dict embeddings & pad mask
-        dict_full, pad_full = self._embed_full_dict()  # (R, L_max, C), (R, L_max)
+        # Full dict embeddings & pad mask (R, L_max, C), (R, L_max)
+        dict_full, pad_full = self._embed_full_dict()
 
-        # Advanced indexing: (B, R_sel, L_max, C) and (B, R_sel, L_max)
-        dict_emb = dict_full[idx_safe]
-        dict_pad_mask = pad_full[idx_safe]
+        # Advanced indexing
+        dict_emb = dict_full[idx_safe]                    # (B, R_sel, L_max, C)
+        dict_pad_mask = pad_full[idx_safe]                # (B, R_sel, L_max)
 
-        # Learned tokens per row: (B, R_sel, T, C)
-        learned = self.learned_tokens_global[idx_safe]
+        # Learned tokens per row
+        learned = self.learned_tokens_global[idx_safe]    # (B, R_sel, T, C)
 
         # Zero out invalid rows completely
-        row_pad_mask_broadcast_LC = row_pad_mask.unsqueeze(-1).unsqueeze(-1)
-        row_pad_mask_broadcast_TC = row_pad_mask.unsqueeze(-1).unsqueeze(-1)
-        dict_emb = dict_emb.masked_fill(row_pad_mask_broadcast_LC, 0.0)
+        dict_emb = dict_emb.masked_fill(row_pad_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
         dict_pad_mask = dict_pad_mask | row_pad_mask.unsqueeze(-1)
-        learned = learned.masked_fill(row_pad_mask_broadcast_TC, 0.0)
+        learned = learned.masked_fill(row_pad_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
 
         return learned, dict_emb, dict_pad_mask, row_pad_mask
+
 
     # ------------------------------------------------------------------
     # Generation integration (first step builds prefix; later steps pass through)
