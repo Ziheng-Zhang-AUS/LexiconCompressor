@@ -8,4 +8,9 @@ results/
 result/
 outputs_lora_trainer/
 logs/
-data/
+requirements.txt
+data/build_training_dataset.py
+data/cleaned_lexicon_tiny.csv
+data/dictionary_mapping.json
+data/lexmatch.py
+data/__pycache__
