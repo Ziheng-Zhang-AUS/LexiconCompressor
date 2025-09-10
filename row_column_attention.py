@@ -1,337 +1,206 @@
-# row_column_attention.py
 from __future__ import annotations
-from typing import List, Optional, Tuple, Dict, Any
-import math
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pad_sequence
 
-from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3DecoderLayer,
-    Qwen3RotaryEmbedding,
-)
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RotaryEmbedding
 from configuration_lexicon_compressor import LexiconCompressorConfig
 
 
 class RowColumnAttention(nn.Module):
-    """
-    Hierarchical Row-Column Attention for lexicon compression.
-    
-    This module performs two-stage attention:
-    1. Row-wise attention: Processes each dictionary entry with its learned tokens
-    2. Column-wise attention: Cross-attention between learned tokens across entries
+    """Two-stage Row–Column attention for lexicon compression (vectorized).
+
+    Inputs (shapes):
+      learned      : (B, R_sel, T, C)
+      dict_emb     : (B, R_sel, L_max, C)
+      dict_pad_mask: (B, R_sel, L_max)  # True = padding position in dict_emb
+      row_pad_mask : (B, R_sel)         # True = padded/invalid row
+
+    Returns:
+      learned_out: (B, R_sel, T, C)
+      dict_out   : (B, R_sel, L_max, C)
+
+    Implementation notes:
+      • Row-wise pass merges (B, R_sel) → (B*R_sel, ·) so each row is processed independently
+        by a Qwen3DecoderLayer over the concatenated sequence [learned; dict].
+      • Column-wise pass merges (B, L_max) → (B*L_max, ·) to mix information *across rows*
+        for the same column index using another Qwen3DecoderLayer.
+      • We build additive attention masks (0 for allow, -inf for block). For padded keys we
+        add -inf; causal structure inside the dict block is preserved.
     """
 
-    def __init__(self, config: LexiconCompressorConfig):
-        """
-        Initialize RowColumnAttention.
-
-        Args:
-            config: LexiconCompressorConfig containing Qwen3 config and compressor options
-        """
+    def __init__(self, config: LexiconCompressorConfig) -> None:
         super().__init__()
         self.config = config
-        qwen_config = config.qwen_config
+        qcfg = config.qwen_config
 
-        self.hidden_size = qwen_config.hidden_size
-        self.num_heads = qwen_config.num_attention_heads
-        self.head_dim = getattr(qwen_config, "head_dim", self.hidden_size // self.num_heads)
-        
-        # Row attention processes each entry + learned tokens independently
-        self.row_layer = Qwen3DecoderLayer(config=qwen_config, layer_idx=0)
-        # Column attention processes learned tokens across entries
-        self.col_layer = Qwen3DecoderLayer(config=qwen_config, layer_idx=1)
-        
-        self.rope = Qwen3RotaryEmbedding(config=qwen_config)
-        
-        # Buffer to track weight loading state
-        self.register_buffer("_weights_loaded", torch.tensor(False))
+        self.channels: int = qcfg.hidden_size  # C
+        self.num_heads: int = qcfg.num_attention_heads
+        self.head_dim: int = getattr(qcfg, "head_dim", self.channels // self.num_heads)
 
-    def load_weights_once(self, row_weights: Dict[str, torch.Tensor], col_weights: Dict[str, torch.Tensor]):
-        """
-        Load decoder-layer weights once for both row and column attention.
+        # Use two decoder layers from Qwen3 as attention processors
+        self.row_layer = Qwen3DecoderLayer(config=qcfg, layer_idx=0)
+        self.col_layer = Qwen3DecoderLayer(config=qcfg, layer_idx=1)
 
-        Args:
-            row_weights: State dict for row decoder layer
-            col_weights: State dict for column decoder layer
-        """
+        self.rope = Qwen3RotaryEmbedding(config=qcfg)
+
+        # One-time weight loading latch
+        self.register_buffer("_weights_loaded", torch.tensor(False), persistent=False)
+
+    # Weight loading (row/col layers)
+    def load_weights_once(self, row_weights: Dict[str, torch.Tensor], col_weights: Dict[str, torch.Tensor]) -> None:
         if self._weights_loaded.item():
             return
-            
         if row_weights is None or col_weights is None:
             raise ValueError("Both row_weights and col_weights must be provided.")
-            
         self.row_layer.load_state_dict(row_weights, strict=True)
         self.col_layer.load_state_dict(col_weights, strict=True)
         self._weights_loaded.fill_(True)
 
-    def _process_single_row(
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _neg_inf(dtype: torch.dtype) -> float:
+        # large negative additive mask value
+        return torch.finfo(dtype).min
+
+    # Build (B*R_sel, 1, L_total, L_total) additive mask for row-wise concat([T], [L])
+    def _row_attention_mask(
         self,
-        learned_row: torch.Tensor,
-        dict_tokens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Process a single row (dict entry + learned tokens) with correct RoPE.
-
-        Args:
-            learned_row: (T, H) Learned compression tokens for this row
-            dict_tokens: (Li, H) Dictionary entry tokens
-
-        Returns:
-            Tuple of:
-                - updated_learned: (T, H) Updated learned tokens
-                - updated_dict: (Li, H) Updated dictionary tokens
-        """
-        device, dtype = learned_row.device, learned_row.dtype
-        num_learned = learned_row.size(0)
-        dict_len = dict_tokens.size(0)
-        
-        prepend_learned = bool(self.config.learned_tokens_prepend)
-        
-        # Concatenate tokens
-        if prepend_learned:
-            # [learned_tokens, dict_tokens]
-            if dict_len > 0:
-                row_tokens = torch.cat([learned_row, dict_tokens], dim=0)  # (T+Li, H)
-            else:
-                row_tokens = learned_row  # (T, H)
-            total_len = num_learned + dict_len
-        else:
-            # [dict_tokens, learned_tokens]
-            if dict_len > 0:
-                row_tokens = torch.cat([dict_tokens, learned_row], dim=0)  # (Li+T, H)
-            else:
-                row_tokens = learned_row  # (T, H)
-            total_len = dict_len + num_learned
-        
-        # Add batch dimension for processing
-        row_tokens = row_tokens.unsqueeze(0)  # (1, total_len, H)
-        
-        # Build proper causal mask - CORRECTED DIMENSIONS
-        attention_mask = self._build_row_causal_mask(
-            total_length=total_len,
-            dict_length=dict_len,
-            prepend_learned=prepend_learned,
-            dtype=dtype,
-            device=device
-        ).unsqueeze(0).unsqueeze(0)  # (L,L) -> (1, 1, L, L)
-        
-        # Build correct position IDs for RoPE
-        position_ids = self._build_row_position_ids(
-            total_length=total_len,
-            dict_length=dict_len,
-            prepend_learned=prepend_learned,
-            device=device
-        ).unsqueeze(0)  # (1, total_len)
-        
-        # Get position embeddings
-        cos, sin = self.rope(row_tokens, position_ids)
-        position_embeddings = (cos, sin)
-        
-        # Apply row attention
-        out = self.row_layer(
-        hidden_states=row_tokens,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        position_embeddings=position_embeddings,
-        past_key_values=None,
-        use_cache=False,
-        )
-        # 支持多种返回格式
-        row_hidden = out[0] if isinstance(out, (tuple, list)) else getattr(out, 'hidden_states', out)
-        row_output = row_hidden.squeeze(0)  # (total_len, H)
-        
-        if prepend_learned:
-            updated_learned = row_output[:num_learned, :]  # (T, H)
-            if dict_len > 0:
-                updated_dict = row_output[num_learned:num_learned+dict_len, :]  # (Li, H)
-            else:
-                updated_dict = torch.empty(0, self.hidden_size, device=device, dtype=dtype)  # (0, H)
-        else:
-            if dict_len > 0:
-                updated_dict = row_output[:dict_len, :]  # (Li, H)
-            else:
-                updated_dict = torch.empty(0, self.hidden_size, device=device, dtype=dtype)  # (0, H)
-            updated_learned = row_output[dict_len:dict_len+num_learned, :]  # (T, H)
-        
-        return updated_learned, updated_dict
-
-    def _build_row_causal_mask(
-        self,
-        total_length: int,
-        dict_length: int,
-        prepend_learned: bool,
+        T: int,
+        L: int,
+        dict_pad_mask_flat: torch.Tensor,  # (B*R_sel, L) bool
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Build causal attention mask for a single row.
+        BxR = dict_pad_mask_flat.size(0)
+        total = T + L
+        mask = torch.zeros(BxR, 1, total, total, dtype=dtype, device=device)
+        neg_inf = self._neg_inf(dtype)
 
-        Args:
-            total_length: Total length of concatenated sequence
-            dict_length: Length of dictionary tokens
-            prepend_learned: Whether learned tokens come first
-            dtype: Tensor data type
-            device: Tensor device
+        # Keys that are padded (in the dict segment) are blocked for all queries
+        # Dict segment occupies columns [T : T+L)
+        pad_cols = dict_pad_mask_flat  # (BxR, L)
+        if pad_cols.any():
+            mask[:, :, :, T: T + L] = mask[:, :, :, T: T + L].masked_fill(
+                pad_cols.unsqueeze(1).unsqueeze(1), neg_inf
+            )
 
-        Returns:
-            attention_mask: (total_length, total_length) Causal attention mask
-        """
-        mask = torch.zeros(total_length, total_length, device=device, dtype=dtype)
-        neg_inf = torch.finfo(dtype).min
-        
-        if prepend_learned:
-            # Learned tokens (first T positions) can attend to themselves and dict tokens
-            num_learned = total_length - dict_length
-            # Dict tokens can only attend to learned tokens and previous dict tokens (causal)
-            if dict_length > 0:
-                causal_dict = torch.tril(torch.ones(dict_length, dict_length, device=device, dtype=torch.bool))
-                # Dict tokens can attend to learned tokens (first num_learned positions)
-                mask[num_learned:, :num_learned] = 0  # Allow attention to learned tokens
-                # Dict tokens have causal attention among themselves
-                mask[num_learned:, num_learned:] = torch.where(
-                    causal_dict, 
-                    torch.tensor(0.0, device=device, dtype=dtype),
-                    torch.tensor(neg_inf, device=device, dtype=dtype)
-                )
-        else:
-            # Dict tokens first, then learned tokens
-            num_learned = total_length - dict_length
-            # Dict tokens have causal attention among themselves
-            if dict_length > 0:
-                causal_dict = torch.tril(torch.ones(dict_length, dict_length, device=device, dtype=torch.bool))
-                mask[:dict_length, :dict_length] = torch.where(
-                    causal_dict,
-                    torch.tensor(0.0, device=device, dtype=dtype),
-                    torch.tensor(neg_inf, device=device, dtype=dtype)
-                )
-            # Learned tokens can attend to everything (no additional masking needed)
-            
+        # Causal attention inside the dict block (queries in dict segment cannot see future dict positions)
+        if L > 0:
+            # Upper-triangular (strictly future) → -inf
+            tril = torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
+            causal_block = torch.where(tril, torch.tensor(0.0, dtype=dtype, device=device), torch.tensor(neg_inf, dtype=dtype, device=device))
+            mask[:, :, T: T + L, T: T + L] = causal_block
+
+        # Learned tokens (first T) can attend everywhere → no extra blocks
+        # Dict queries should be allowed to attend to learned tokens (columns [:T]) → already 0
         return mask
 
-    def _build_row_position_ids(
+    # Build (B*L_max, 1, R_sel, R_sel) additive mask for column-wise mixing across rows
+    def _col_attention_mask(
         self,
-        total_length: int,
-        dict_length: int,
-        prepend_learned: bool,
+        row_pad_mask_flat: torch.Tensor,  # (B*L_max, R_sel) bool
+        dtype: torch.dtype,
         device: torch.device,
-    ) -> torch.LongTensor:
-        """
-        Build position IDs for a single row with correct sequential positions.
-
-        Args:
-            total_length: Total length of concatenated sequence
-            dict_length: Length of dictionary tokens
-            prepend_learned: Whether learned tokens come first
-            device: Tensor device
-
-        Returns:
-            position_ids: (total_length,) Position IDs for RoPE
-        """
-        position_ids = torch.arange(total_length, device=device, dtype=torch.long)
-        return position_ids
-
-    def _process_column_attention(
-        self,
-        learned_tokens_batch: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Process column-wise attention across learned tokens from all rows.
-
-        Args:
-            learned_tokens_batch: (B, T, H) learned tokens from row attention
-
-        Returns:
-            updated_learned_tokens: (B, T, H) Updated learned tokens after column attention
-        """
-        batch_size, num_learned, hidden_size = learned_tokens_batch.shape
-        device, dtype = learned_tokens_batch.device, learned_tokens_batch.dtype
-        
-        # Build column attention mask (full attention) - CORRECTED DIMENSIONS
-        attention_mask = torch.zeros(
-            batch_size, 1, num_learned, num_learned, 
-            device=device, dtype=dtype
-        )
-        
-        # Build identity position embeddings for column attention
-        position_ids = torch.arange(num_learned, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        dummy_input = torch.empty(batch_size, num_learned, hidden_size, device=device, dtype=dtype)
-        cos, sin = self.rope(dummy_input, position_ids)
-        # Use identity RoPE (cos=1, sin=0)
-        head_dim = self.head_dim
-        cos_identity = torch.ones(batch_size, num_learned, head_dim, device=device, dtype=dtype)
-        sin_identity = torch.zeros(batch_size, num_learned, head_dim, device=device, dtype=dtype)
-        position_embeddings = (cos_identity, sin_identity)
-        
-        # 修复：正确处理Qwen3DecoderLayer输出
-        out = self.col_layer(
-            hidden_states=learned_tokens_batch,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            position_embeddings=position_embeddings,
-            past_key_values=None,
-            use_cache=False,
-        )
-        col_hidden = out[0] if isinstance(out, (tuple, list)) else getattr(out, 'hidden_states', out)
-        
-        return col_hidden
+        BxL, R_sel = row_pad_mask_flat.shape
+        mask = torch.zeros(BxL, 1, R_sel, R_sel, dtype=dtype, device=device)
+        neg_inf = self._neg_inf(dtype)
+        # Block padded rows as keys for all queries
+        if row_pad_mask_flat.any():
+            mask[:, :, :, :] = mask[:, :, :, :].masked_fill(
+                row_pad_mask_flat.unsqueeze(1).unsqueeze(1), neg_inf
+            )
+        # (Option) keep non-causal/full attention across rows by not adding triangular mask
+        return mask
 
     def forward(
         self,
-        learned_tokens: torch.Tensor,
-        dict_tokens_list: List[torch.Tensor],
-        **kwargs: Any,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Forward pass through hierarchical row-column attention.
+        learned: torch.Tensor,           # (B, R_sel, T, C)
+        dict_emb: torch.Tensor,          # (B, R_sel, L_max, C)
+        *,
+        dict_pad_mask: Optional[torch.Tensor] = None,  # (B, R_sel, L_max) bool
+        row_pad_mask: Optional[torch.Tensor] = None,   # (B, R_sel) bool
+        **_: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, R_sel, T, C = learned.shape
+        L_max = dict_emb.size(2)
+        device, dtype = learned.device, learned.dtype
 
-        Args:
-            learned_tokens: (B, T, H) Learnable compression tokens
-            dict_tokens_list: List of (Li, H) dictionary entry tokens
+        if dict_pad_mask is None:
+            dict_pad_mask = torch.zeros(B, R_sel, L_max, dtype=torch.bool, device=device)
+        if row_pad_mask is None:
+            row_pad_mask = torch.zeros(B, R_sel, dtype=torch.bool, device=device)
 
-        Returns:
-            Tuple of:
-                - updated_learned_tokens: (B, T, H) Updated learned tokens (after column attention)
-                - updated_dict_list: List of (Li, H) Updated dictionary tokens (after row attention)
-        """
-        batch_size, num_learned, hidden_size = learned_tokens.shape
-        device, dtype = learned_tokens.device, learned_tokens.dtype
-        
-        # Validate input dimensions
-        if len(dict_tokens_list) != batch_size:
-            raise ValueError(
-                f"Batch size mismatch: learned_tokens has {batch_size} entries "
-                f"but dict_tokens_list has {len(dict_tokens_list)} entries"
-            )
-            
-        if hidden_size != self.hidden_size:
-            raise ValueError(
-                f"Hidden size mismatch: expected {self.hidden_size}, got {hidden_size}"
-            )
+        # Broadcast row mask over dict length (padded rows → all dict positions invalid)
+        dict_pad_mask = dict_pad_mask | row_pad_mask.unsqueeze(-1)  # (B, R_sel, L_max)
 
-        # Process each row individually with correct RoPE
-        updated_learned_list = []
-        updated_dict_list = []
-        
-        for batch_idx in range(batch_size):
-            learned_row = learned_tokens[batch_idx]  # (T, H)
-            dict_tokens = dict_tokens_list[batch_idx]  # (Li, H)
-            
-            updated_learned, updated_dict = self._process_single_row(
-                learned_row, dict_tokens
-            )
-            
-            updated_learned_list.append(updated_learned)  # (T, H)
-            updated_dict_list.append(updated_dict)  # (Li, H)
-        
-        # Stack learned tokens for column attention
-        learned_tokens_batch = torch.stack(updated_learned_list, dim=0)  # (B, T, H)
-        
-        # Process column attention across learned tokens
-        final_learned_tokens = self._process_column_attention(learned_tokens_batch)
-        
-        return final_learned_tokens, updated_dict_list
+
+
+
+
+        # Row-wise attention
+
+        # (B*R_sel, T, C) and (B*R_sel, L_max, C)
+        learned_row = learned.contiguous().view(B * R_sel, T, C)
+        dict_row = dict_emb.contiguous().view(B * R_sel, L_max, C)
+        dict_pad_row = dict_pad_mask.contiguous().view(B * R_sel, L_max)
+
+        # Concatenate [learned; dict] along sequence
+        concat_row = torch.cat([learned_row, dict_row], dim=1)  # (B*R_sel, T+L_max, C)
+        total_len = T + L_max
+
+        # Position ids for RoPE
+        pos_ids_row = torch.arange(total_len, device=device, dtype=torch.long).unsqueeze(0).expand(B * R_sel, -1)
+        # Qwen3DecoderLayer accepts position_embeddings; compute them
+        cos_row, sin_row = self.rope(concat_row, pos_ids_row)
+        attn_mask_row = self._row_attention_mask(T, L_max, dict_pad_row, dtype, device)  # (B*R_sel, 1, total, total)
+
+        out_row = self.row_layer(
+            hidden_states=concat_row,
+            attention_mask=attn_mask_row,
+            position_ids=pos_ids_row,
+            position_embeddings=(cos_row, sin_row),
+            past_key_values=None,
+            use_cache=False,
+        )
+        hs_row = out_row[0] if isinstance(out_row, (tuple, list)) else getattr(out_row, "hidden_states", out_row)
+        # Split back
+        learned_upd = hs_row[:, :T, :]
+        dict_upd_row = hs_row[:, T:, :]
+
+        learned_upd = learned_upd.view(B, R_sel, T, C)
+        dict_upd_row = dict_upd_row.view(B, R_sel, L_max, C)
+
+
+
+
+        # 2) Column-wise (across rows)
+
+        # Transpose first, then view → (B*L_max, R_sel, C)
+        dict_for_col = dict_upd_row.transpose(1, 2).contiguous().view(B * L_max, R_sel, C)
+        row_pad_for_col = row_pad_mask.unsqueeze(1).expand(B, L_max, R_sel).contiguous().view(B * L_max, R_sel)
+
+        pos_ids_col = torch.arange(R_sel, device=device, dtype=torch.long).unsqueeze(0).expand(B * L_max, -1)
+        cos_col, sin_col = self.rope(dict_for_col, pos_ids_col)
+        attn_mask_col = self._col_attention_mask(row_pad_for_col, dtype, device)  # (B*L_max, 1, R_sel, R_sel)
+
+        out_col = self.col_layer(
+            hidden_states=dict_for_col,
+            attention_mask=attn_mask_col,
+            position_ids=pos_ids_col,
+            position_embeddings=(cos_col, sin_col),
+            past_key_values=None,
+            use_cache=False,
+        )
+        hs_col = out_col[0] if isinstance(out_col, (tuple, list)) else getattr(out_col, "hidden_states", out_col)
+        # Back to (B, R_sel, L_max, C)
+        dict_upd_col = hs_col.view(B, L_max, R_sel, C).transpose(1, 2).contiguous()
+
+        return learned_upd, dict_upd_col
 
     def extra_repr(self) -> str:
-        return f"hidden_size={self.hidden_size}, num_heads={self.num_heads}"
+        return f"channels={self.channels}, num_heads={self.num_heads}"
