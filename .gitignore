@@ -1,3 +1,11 @@
 /__pycache__/
 cleaned_lexicon_tiny.csv
 row_column_attention_stack.py
+ds_zero2_fp16.json
+inference.py
+wandb/
+results/
+result/
+outputs_lora_trainer/
+logs/
+data/
