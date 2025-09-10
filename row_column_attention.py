@@ -26,7 +26,7 @@ class RowColumnAttention(nn.Module):
         by a Qwen3DecoderLayer over the concatenated sequence [learned; dict].
       • Column-wise pass merges (B, L_max) → (B*L_max, ·) to mix information *across rows*
         for the same column index using another Qwen3DecoderLayer.
-      • We build additive attention masks (0 for allow, -inf for block). For padded keys we
+      • Build additive attention masks (0 for allow, -inf for block). For padded keys we
         add -inf; causal structure inside the dict block is preserved.
     """
 
