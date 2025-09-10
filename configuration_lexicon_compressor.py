@@ -1,4 +1,4 @@
-# configuration_lexicon_compressor.py
+# configuration_lexicon_compressor
 from typing import Optional
 from transformers import PretrainedConfig
 
