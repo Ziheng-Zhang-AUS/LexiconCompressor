@@ -14,7 +14,7 @@ from row_column_attention import RowColumnAttention
 from configuration_lexicon_compressor import LexiconCompressorConfig
 
 
-# -----------------------------------------------------------------------------
+# ---------------------a--------------------------------------------------------
 # Outputs
 # -----------------------------------------------------------------------------
 @dataclass
@@ -39,7 +39,7 @@ class LexiconCompressorModelOutput(CausalLMOutputWithPast):
 class LexiconCompressorModel(nn.Module):
     """Vectorized dictionary-to-prefix wrapper over Qwen3.
 
-    Pipeline:
+    Pipeline:RowColumnAttention
       1) pad the full dictionary to a tensor (R, L_max),
       2) embed once as (R, L_max, C) with a pad mask (R, L_max),
       3) gather per-batch rows via advanced indexing (no Python loops),
