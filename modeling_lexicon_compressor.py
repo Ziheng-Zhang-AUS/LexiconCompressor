@@ -309,7 +309,7 @@ class LexiconCompressorModel(nn.Module):
         embeds = self._build_qwen_inputs_embeds(input_ids, inputs_embeds)  # (B, S, C)
         B, S, C = embeds.shape
 
-        if not row_indices_per_sample:
+        if row_indices_per_sample is None:
             return {"inputs_embeds": embeds, "attention_mask": attention_mask}
 
         # Get layer weights if not provided
@@ -600,7 +600,7 @@ if __name__ == "__main__":
         print("Testing Functional LexiconCompressorModel with real Qwen...")
         
         # Configuration
-        model_name = "Qwen/Qwen2.5-0.5B"  # Use base model instead of instruct for compatibility
+        model_name = "Qwen/Qwen3-0.6B"  # Use base model instead of instruct for compatibility
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {device}")
         
@@ -614,7 +614,7 @@ if __name__ == "__main__":
             # Use generic AutoModelForCausalLM to avoid Qwen3 dependency
             qwen_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                torch_dtype=torch.float32,
                 device_map=device if device == "cuda" else None,
                 trust_remote_code=True
             )

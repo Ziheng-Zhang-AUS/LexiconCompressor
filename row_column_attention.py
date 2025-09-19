@@ -231,8 +231,9 @@ def attention_functional(
     
     # Reshape and project output
     attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(batch_size, seq_len, hidden_size)
+    attn_output = attn_output.reshape(batch_size, seq_len, num_attention_heads*head_dim)
     attn_output = F.linear(attn_output, o_weight, o_bias)
+
     
     return attn_output
 
