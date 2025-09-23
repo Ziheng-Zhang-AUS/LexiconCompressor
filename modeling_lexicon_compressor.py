@@ -277,6 +277,10 @@ class LexiconCompressorModel(PreTrainedModel):
         """
         if len(layer_weights) != len(self.dict_encoder):
             raise ValueError(f"Expected {len(self.dict_encoder)} weight dicts, got {len(layer_weights)}")
+
+        base_dtype = self._dtype()
+        learned = learned.to(base_dtype)
+        dict_emb = dict_emb.to(base_dtype)
         
         for i, (rca_layer, weights) in enumerate(zip(self.dict_encoder, layer_weights)):
             # For functional RCA, we need to provide both row and column weights

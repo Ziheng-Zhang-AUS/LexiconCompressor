@@ -11,10 +11,6 @@ from modeling_lexicon_compressor import LexiconCompressorModel
 from tokenization_lexicon_compressor import LexiconCompressorTokenizor
 
 
-# import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-
 # ===== Custom collator for handling row_indices_per_sample =====
 class CustomDataCollator:
     def __init__(self, tokenizer):
@@ -110,7 +106,7 @@ class LexiconTrainer(Trainer):
 
 def main():
     # ==== Tokenizer ====
-    model_name = "Qwen/Qwen3-0.6B"
+    model_name = "Qwen/Qwen3-1.7B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -119,7 +115,7 @@ def main():
     base_qwen = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.bfloat16,
     )
 
 # # 应该是几亿到几十亿，不会是 0
@@ -142,6 +138,7 @@ def main():
         dict_encoder_num_compress_tokens=4,
         dict_encoder_learned_tokens_prepend=True,
     )
+    model.qwen.gradient_checkpointing_enable()
     # print("====")
     # print(sum(p.numel() for p in model.qwen.parameters()))
 
@@ -181,7 +178,7 @@ def main():
     # ==== Collator & Args ====
     data_collator = CustomDataCollator(tokenizer)
     training_args = TrainingArguments(
-        output_dir="./outputs",
+        output_dir="./outputs/1.7B/2",
         report_to="none",
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
@@ -189,10 +186,11 @@ def main():
         learning_rate=5e-5,
         num_train_epochs=100,
         logging_steps=10,
-        save_strategy="epoch",
-        eval_strategy="epoch",
+        save_strategy="steps",
+        save_steps=50,
+        eval_strategy="steps",
+        eval_steps=50,
         save_total_limit=10,
-        fp16=torch.cuda.is_available(),
         dataloader_drop_last=True,
         remove_unused_columns=False,
         # deepspeed="deepspeed/ds_config.json"
