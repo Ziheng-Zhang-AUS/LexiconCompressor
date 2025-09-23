@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import Qwen3Config, Qwen3ForCausalLM
+from transformers import Qwen3Config, Qwen3ForCausalLM, PreTrainedModel
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -36,7 +36,7 @@ class LexiconCompressorModelOutput(CausalLMOutputWithPast):
 # -----------------------------------------------------------------------------
 # Model
 # -----------------------------------------------------------------------------
-class LexiconCompressorModel(nn.Module):
+class LexiconCompressorModel(PreTrainedModel):
     """Vectorized dictionary-to-prefix wrapper over Qwen3 with functional RowColumnAttention.
 
     Pipeline:
@@ -58,31 +58,56 @@ class LexiconCompressorModel(nn.Module):
         dict_encoder_learned_tokens_prepend: bool = True,
         compressor_config: Optional[LexiconCompressorConfig] = None,
     ) -> None:
-        super().__init__()
+        
+        # ===== 第一步：纯数据计算，为创建 config 做准备 =====
         if not isinstance(qwen_model, Qwen3ForCausalLM):
-            # For testing, also accept Qwen2 models (since Qwen3 might not be available)
             model_class_name = qwen_model.__class__.__name__
             if "Qwen" not in model_class_name:
                 raise ValueError(f"qwen_model must be a Qwen model, got {model_class_name}")
             print(f"Warning: Using {model_class_name} instead of Qwen3ForCausalLM for testing")
 
+        # 提取创建 config 所需的信息
+        qwen_config_temp = qwen_model.config
+        num_layers_temp = len(qwen_model.model.layers)
+        channels_temp = qwen_config_temp.hidden_size
+        num_heads_temp = qwen_config_temp.num_attention_heads
+        head_dim_temp = getattr(qwen_config_temp, "head_dim", channels_temp // num_heads_temp)
+
+        # 处理词典数据
+        num_rows_temp = len(full_dict)
+        lens_temp = torch.tensor([len(r) for r in full_dict], dtype=torch.long) if num_rows_temp > 0 else torch.zeros(0, dtype=torch.long)
+        row_max_len_temp = int(lens_temp.max().item()) if num_rows_temp > 0 else 1
+
+        # 创建 config
+        self.config = compressor_config or LexiconCompressorConfig(
+            qwen_config=qwen_config_temp,
+            num_layers=num_layers_temp,
+            num_compress_tokens=dict_encoder_num_compress_tokens,
+            learned_tokens_prepend=dict_encoder_learned_tokens_prepend,
+        )
+
+        # ===== 第二步：立即调用父类初始化 =====
+        super().__init__(self.config)
+
+        # ===== 第三步：现在可以安全地赋值所有模块、参数和缓冲区 =====
         # Base model refs
         self.qwen = qwen_model
-        self.qwen_config: Qwen3Config = qwen_model.config
-        self.channels: int = self.qwen_config.hidden_size  # C
-        self.num_heads: int = self.qwen_config.num_attention_heads
-        self.head_dim: int = getattr(self.qwen_config, "head_dim", self.channels // self.num_heads)
+        self.qwen.tie_weights()
+        print("model.qwen has been tie weights during init.")
+        self.qwen_config: Qwen3Config = self.config.qwen_config # <-- 注意：这里从 self.config 读取
+        self.channels: int = channels_temp  # C
+        self.num_heads: int = num_heads_temp
+        self.head_dim: int = head_dim_temp
 
         # Dictionary
         self.full_dict_list = full_dict
-        self.num_rows = len(full_dict)
-        lens = torch.tensor([len(r) for r in full_dict], dtype=torch.long) if self.num_rows > 0 else torch.zeros(0, dtype=torch.long)
-        self.row_max_len = int(lens.max().item()) if self.num_rows > 0 else 1
+        self.num_rows = num_rows_temp
+        self.row_max_len = row_max_len_temp
 
         # Build (R, L_max) filled with -1, then scatter valid tokens by a boolean mask
         idx_padded = torch.full((self.num_rows, self.row_max_len), -1, dtype=torch.long)  # (R, L_max)
         col = torch.arange(self.row_max_len).expand(self.num_rows, -1)              # (R, L_max)
-        valid_mask = col < lens.unsqueeze(1)                                        # (R, L_max) bool
+        valid_mask = col < lens_temp.unsqueeze(1)                                        # (R, L_max) bool
         flat_vals = torch.tensor([x for row in full_dict for x in row], dtype=torch.long)
         idx_padded[valid_mask] = flat_vals                                          # row-major fill
         pad_mask = idx_padded.eq(-1)                                                    # (R, L_max) bool
@@ -90,19 +115,13 @@ class LexiconCompressorModel(nn.Module):
         self.register_buffer("full_dict_pad_mask", pad_mask, persistent=False)
 
         # Learned tokens per row: (R, T, C)
-        self.num_layers = len(self.qwen.model.layers)  # equals to the number of qwen decoder layers
+        self.num_layers = num_layers_temp  # equals to the number of qwen decoder layers
         self.num_compress_tokens = dict_encoder_num_compress_tokens  # T
         self.learned_tokens_prepend = dict_encoder_learned_tokens_prepend
         init = torch.randn(self.num_rows, self.num_compress_tokens, self.channels)
         self.learned_tokens_global = nn.Parameter(init)
 
         # Functional RCA stack - no parameters, purely functional modules
-        self.config = compressor_config or LexiconCompressorConfig(
-            qwen_config=self.qwen_config,
-            num_layers=self.num_layers,
-            num_compress_tokens=self.num_compress_tokens,
-            learned_tokens_prepend=self.learned_tokens_prepend,
-        )
         self.dict_encoder = nn.ModuleList([
             RowColumnAttention(self.config) for _ in range(self.num_layers)
         ])
@@ -161,25 +180,24 @@ class LexiconCompressorModel(nn.Module):
             return 0
 
     def extract_qwen_layer_weights(self, layer_idx: int) -> Dict[str, torch.Tensor]:
-        """Extract weights from a specific Qwen3DecoderLayer for functional use.
-        
-        Args:
-            layer_idx: Layer index to extract weights from
-            
-        Returns:
-            Dictionary of weights with keys matching functional implementation expectations
-        """
+        """Extract weights from a specific Qwen3DecoderLayer for functional use."""
         if layer_idx >= len(self.qwen.model.layers):
             raise ValueError(f"Layer index {layer_idx} out of range (max: {len(self.qwen.model.layers)-1})")
         
         layer = self.qwen.model.layers[layer_idx]
         weights = {}
-        
-        # Extract all weights with proper naming
+        # qwen_core = getattr(self.qwen, "module", self.qwen)  
+        # layer = qwen_core.model.layers[layer_idx]
+        # print(sum(p.numel() for p in layer.parameters()))
+
+        # 直接拿参数
         for name, param in layer.named_parameters():
-            weights[name] = param
-            
+            # param 是 nn.Parameter，需要 .data 或 .detach() 转成 Tensor
+            weights[name] = param.detach().clone()
+            # print(f"{name}: {tuple(param.shape)}")
+        
         return weights
+
 
     def get_all_layer_weights(self) -> List[Dict[str, torch.Tensor]]:
         """Extract weights from all Qwen3 layers for functional RCA use.
@@ -264,6 +282,7 @@ class LexiconCompressorModel(nn.Module):
             # For functional RCA, we need to provide both row and column weights
             # In this case, we use the same layer weights for both passes
             # You might want to use different layer weights or create separate weight sets
+            # print(f"RCA layer{i} got weights, type of {type(weights)}")
             out = rca_layer(
                 learned=learned,
                 dict_emb=dict_emb,
@@ -376,6 +395,8 @@ class LexiconCompressorModel(nn.Module):
         # Get layer weights if not provided
         if layer_weights is None:
             layer_weights = self.get_all_layer_weights()
+            # print("LexiconCompressorModel automatically get all qwen layer weights.")
+            # print(type(layer_weights))
 
         if past_key_values is None:  # First step of decoding
             # First step: build prefix
@@ -486,6 +507,58 @@ class LexiconCompressorModel(nn.Module):
             attentions=out.attentions,
             compressed_tokens=compressed_tokens_list,
         )
+
+
+
+        # ------------------------------------------------------------------
+    # Model Saving (Fix for shared tensors)
+    # ------------------------------------------------------------------
+    def _save(self, output_dir: str):
+        """
+        Custom save method to handle shared tensors in the wrapped Qwen model.
+        This overrides the default behavior in Hugging Face Trainer that causes the safetensors error.
+        
+        Uses `safetensors.torch.save_model` which correctly handles weight sharing.
+        """
+        print("Save model using customized '_save' method")
+        from safetensors.torch import save_model as safe_save_model
+        import os
+
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+
+
+        # Save the entire model using safetensors' model-aware function
+        # This function intelligently handles shared memory tensors.
+        safe_save_model(self, os.path.join(output_dir, "model.safetensors"))
+
+        # Save the model's configuration if it has one (highly recommended for reloading)
+        if hasattr(self, 'config') and self.config is not None:
+            self.config.save_pretrained(output_dir)
+        else:
+            # If you don't have a config yet, consider creating one based on LexiconCompressorConfig
+            print("Warning: No 'config' attribute found. Consider adding one for easier model reloading.")
+
+        # Optional: Save any additional custom components
+        # For example, if your dictionary or tokenizer state needs to be saved, do it here.
+        # You might want to save `self.full_dict_list` or metadata about the learned tokens.
+        # torch.save(self.full_dict_list, os.path.join(output_dir, "dictionary.pt"))
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        print(f"Received kwargs: {list(kwargs.keys())}") # 打印收到的所有额外参数
+
+        # 如果传入了 state_dict，我们可以选择警告用户
+        if 'state_dict' in kwargs:
+            print("Warning: Ignoring provided 'state_dict' in favor of custom save logic.")
+
+        # 如果 safe_serialization 是 False，你可以选择回退到 torch.save
+        # 但在你的情况下，你的 _save 方法已经强制使用 safetensors，所以可以忽略
+        # safe_serialization = kwargs.get('safe_serialization', True)
+
+        # 执行你的自定义保存逻辑
+        self._save(save_directory)
+        print(f"Model saved to {save_directory}")
+    
 
     def extra_repr(self) -> str:
         return (

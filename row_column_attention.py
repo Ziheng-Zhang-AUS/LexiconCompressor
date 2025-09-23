@@ -244,6 +244,7 @@ def qwen3_decoder_layer_functional(
     position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     weights_dict: Dict[str, torch.Tensor],
     config_dict: Dict[str, Any],
+    return_hidden_states: bool = False,
 ) -> torch.Tensor:
     """
     Functional implementation of Qwen3DecoderLayer.forward().
@@ -284,11 +285,14 @@ def qwen3_decoder_layer_functional(
     
     # 1. Input LayerNorm
     residual = hidden_states
+    # print("Available weight keys:", weights_dict.keys())
     hidden_states = rms_norm_functional(
         hidden_states, 
         weights_dict["input_layernorm.weight"], 
         rms_norm_eps
     )
+    
+
     
     # 2. Self Attention
     attn_output = attention_functional(
@@ -434,6 +438,7 @@ class RowColumnAttention(nn.Module):
         *,
         dict_pad_mask: Optional[torch.Tensor] = None,  # (B, R_sel, L_max) bool
         row_pad_mask: Optional[torch.Tensor] = None,   # (B, R_sel) bool
+        return_hidden_states: bool = False,
         **_: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, R_sel, T, C = learned.shape
@@ -479,6 +484,7 @@ class RowColumnAttention(nn.Module):
             position_embeddings=position_embeddings_row,
             weights_dict=row_weights_dict,
             config_dict=self.functional_config,
+            return_hidden_states=return_hidden_states,
         )
         
         # Split back
@@ -509,6 +515,7 @@ class RowColumnAttention(nn.Module):
             position_embeddings=position_embeddings_col,
             weights_dict=col_weights_dict,
             config_dict=self.functional_config,
+            return_hidden_states=return_hidden_states,
         )
         
         # Back to (B, R_sel, L_max, C)

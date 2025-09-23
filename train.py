@@ -1,268 +1,218 @@
-import os
-import json
-import csv
+# train.py
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset
+from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
-    Qwen3ForCausalLM,
-    Trainer,
+    AutoModelForCausalLM,
     TrainingArguments,
-    PreTrainedModel,
+    Trainer,
 )
-from configuration_lexicon_compressor import LexiconCompressorConfig
-from modeling_lexicon_compressor import LexiconCompressorModel, LexiconCompressorModelOutput
+from modeling_lexicon_compressor import LexiconCompressorModel
 from tokenization_lexicon_compressor import LexiconCompressorTokenizor
 
 
-# ==============================
-# 1) HF wrapper (inject RCA weights once)
-# ==============================
-class LexiconCompressorHFModel(PreTrainedModel):
-    """HuggingFace wrapper that:
-      • owns the vectorized LexiconCompressorModel
-      • loads Row/Column Attention weights once (from Qwen layers) on the first call
-    """
-
-    config_class = LexiconCompressorConfig
-
-    def __init__(self, config: LexiconCompressorConfig, qwen_model: Qwen3ForCausalLM, full_dict):
-        super().__init__(config)
-        self.qwen = qwen_model
-        self.model = LexiconCompressorModel(
-            qwen_model=qwen_model,
-            full_dict=full_dict,
-            dict_encoder_num_compress_tokens=config.num_compress_tokens,
-            dict_encoder_learned_tokens_prepend=config.learned_tokens_prepend,
-            compressor_config=config,
-        )
-        self._rca_loaded: bool = False
-
-    def _build_attention_weights(self):
-        """Create per-layer (row_weights, col_weights) from Qwen's own decoder layers.
-        This mirrors the Qwen3DecoderLayer state dict into both row/col processors.
-        """
-        layer_weights = []
-        for layer in self.qwen.model.layers:
-            sd = layer.state_dict()
-            # Use the same weights for row and column paths by default
-            layer_weights.append((sd, sd))
-        return layer_weights
-
-    def forward(self, **kwargs):
-        # Inject RCA weights once
-        if not self._rca_loaded:
-            attn_w = self._build_attention_weights()
-            out = self.model(attention_weights=attn_w, **kwargs)
-            self._rca_loaded = True
-            return out
-        return self.model(**kwargs)
+# import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
-# ==============================
-# 2) Dataset
-# ==============================
-class LexiconDataset(Dataset):
-    def __init__(self, data_file, tokenizer, max_length=512):
-        with open(data_file, 'r', encoding='utf-8') as f:
-            self.data = json.load(f)
+# ===== Custom collator for handling row_indices_per_sample =====
+class CustomDataCollator:
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        self.max_length = max_length
 
-    def __len__(self):
-        return len(self.data)
+    def __call__(self, features, return_tensors="pt"):
+        row_indices_list = []
+        cleaned_features = []
 
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        instruction = item.get('instruction', '')
-        source_text = item.get('source_text', '')
-        target_text = item.get('target_text', '')
-        full_text = f"{instruction}{source_text}\n{target_text}"
+        for feature in features:
+            row_indices = feature.pop("row_indices_per_sample", [])
+            row_indices_list.append(row_indices)
 
-        enc = self.tokenizer(
-            full_text,
-            return_tensors="pt",
-            truncation=True,
-            padding="max_length",
-            max_length=self.max_length,
-            return_attention_mask=True,
-        )
-        input_ids = enc['input_ids'].squeeze(0)
-        attention_mask = enc['attention_mask'].squeeze(0)
+            if "input_ids" in feature and len(feature["input_ids"]) > 0:
+                cleaned_features.append(feature)
+            else:
+                print(f"⚠️ Warning: Skipping feature with empty input_ids")
+                row_indices_list[-1] = []
 
-        labels = input_ids.clone()
-        # (Option) mask label parts here if needed
+        if not cleaned_features:
+            print("❌ Error: All features in batch are empty")
+            dummy_ids = [self.tokenizer.eos_token_id]
+            cleaned_features = [{
+                "input_ids": dummy_ids,
+                "attention_mask": [1],
+            
+                "labels": dummy_ids
+            }]
+            row_indices_list = [[]]
 
-        return {
-            "qwen_input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "row_indices_per_sample": item['dict_indices'],
+        # ==== padding input_ids / attention_mask / labels ====
+        max_length = max(len(f["input_ids"]) for f in cleaned_features)
+        batch_input_ids, batch_attention_mask, batch_labels = [], [], []
+
+        for f in cleaned_features:
+            input_ids = f["input_ids"]
+            labels = f.get("labels", input_ids.copy())
+            pad_len = max_length - len(input_ids)
+
+            padded_input_ids = input_ids + [self.tokenizer.pad_token_id] * pad_len
+            padded_labels = labels + [-100] * pad_len
+            attention_mask = [1] * len(input_ids) + [0] * pad_len
+
+            batch_input_ids.append(padded_input_ids)
+            batch_attention_mask.append(attention_mask)
+            batch_labels.append(padded_labels)
+
+        batch = {
+            "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(batch_attention_mask, dtype=torch.long),
+            "labels": torch.tensor(batch_labels, dtype=torch.long),
         }
 
-
-# ==============================
-# 3) DataCollator
-# ==============================
-class LexiconDataCollator:
-    def __call__(self, features):
-        batch = {}
-        # Vectorize row indices so DataParallel/DDP can scatter along batch dim
-        rows = [torch.as_tensor(f["row_indices_per_sample"], dtype=torch.long) for f in features]
-        if len(rows) > 0:
-            R_sel = max(int(r.numel()) for r in rows)
-            rows = [F.pad(r, (0, R_sel - int(r.numel())), value=-1) if int(r.numel()) < R_sel else r for r in rows]
-            batch["row_indices_per_sample"] = torch.stack(rows, dim=0)  # (B, R_sel)
+        # ==== padding row_indices ====
+        if row_indices_list and any(len(r) > 0 for r in row_indices_list):
+            max_len = max(len(r) for r in row_indices_list if len(r) > 0)
+            padded_indices = torch.full((len(row_indices_list), max_len), -1, dtype=torch.long)
+            for i, indices in enumerate(row_indices_list):
+                if len(indices) > 0:
+                    valid_len = min(len(indices), max_len)
+                    padded_indices[i, :valid_len] = torch.tensor(indices[:valid_len], dtype=torch.long)
+            batch["row_indices_per_sample"] = padded_indices
         else:
-            batch["row_indices_per_sample"] = torch.empty(0, 0, dtype=torch.long)
+            batch["row_indices_per_sample"] = torch.full((len(cleaned_features), 1), -1, dtype=torch.long)
 
-        # Stack the rest
-        for key in features[0]:
-            if key == "row_indices_per_sample":
-                continue
-            batch[key] = torch.stack([f[key] for f in features], dim=0)
         return batch
 
 
-# ==============================
-# 4) Trainer
-# ==============================
-class LexiconCompressorTrainer(Trainer):
+# ===== Custom Trainer (remap input_ids → qwen_input_ids) =====
+class LexiconTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        row_indices_per_sample = inputs.pop("row_indices_per_sample", None)
-        outputs = model(**inputs, row_indices_per_sample=row_indices_per_sample)
-        loss = outputs.loss if isinstance(outputs, LexiconCompressorModelOutput) else outputs[0]
+        labels = inputs.pop("labels", None)
+        row_indices = inputs.pop("row_indices_per_sample", None)
+
+        # === 映射字段名 ===
+        if "input_ids" in inputs:
+            inputs["qwen_input_ids"] = inputs.pop("input_ids")
+        if "attention_mask" in inputs:
+            inputs["qwen_attention_mask"] = inputs.pop("attention_mask")
+
+        # print("++++")
+        # print(sum(p.numel() for p in model.qwen.parameters()))
+
+        outputs = model(
+            **inputs,
+            labels=labels,
+            row_indices_per_sample=row_indices,
+            use_cache=False,
+        )
+        loss = outputs.loss if outputs.loss is not None else torch.tensor(0.0, requires_grad=True)
         return (loss, outputs) if return_outputs else loss
 
 
-# ==============================
-# 5) Save fallback
-# ==============================
-def save_model_safe(model, tokenizer, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    try:
-        model.save_pretrained(output_dir, safe_serialization=False)
-        tokenizer.save_pretrained(output_dir)
-        print(f"Model saved successfully to {output_dir}")
-    except Exception as e:
-        print(f"Standard save failed: {e}\nUsing alternative save method...")
-        try:
-            torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
-            model.config.save_pretrained(output_dir)
-            tokenizer.save_pretrained(output_dir)
-            print(f"Model saved with alternative method to {output_dir}")
-        except Exception as e2:
-            print(f"Alternative save also failed: {e2}")
-
-
-# ==============================
-# 6) Dictionary loader (consistency)
-# ==============================
-def load_dictionary_consistent(csv_path: str):
-    entries = []
-    with open(csv_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            lexical_unit = row.get('lexical_unit', '').strip()
-            if lexical_unit:
-                entries.append({
-                    'lexical_unit': lexical_unit,
-                    'variant': row.get('variant', '').strip(),
-                    'pos': row.get('pos', '').strip(),
-                    'gloss': row.get('gloss', '').strip(),
-                })
-    return entries
-
-
-# ==============================
-# 7) Main
-# ==============================
 def main():
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # ==== Tokenizer ====
+    model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    CSV_PATH = "./data/cleaned_lexicon_tiny.csv"
-    MODEL_NAME = "Qwen/Qwen3-0.6B"
-    TRAIN_DATA_PATH = "./data/train.json"
-    OUTPUT_DIR = "./results"
+    # ==== Base Qwen ====
+    base_qwen = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.float32,
+    )
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+# # 应该是几亿到几十亿，不会是 0
+#     print(list(base_qwen.model.layers[0].named_parameters())[:5])
 
-    print("Loading tokenizer and base model...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    qwen_model = Qwen3ForCausalLM.from_pretrained(MODEL_NAME)
 
-    print("Tokenizing dictionary...")
-    dict_tokenizer = LexiconCompressorTokenizor(
-        csv_path=CSV_PATH,
+    # ==== Dictionary ====
+    lex_tokenizer = LexiconCompressorTokenizor(
+        csv_path="data/cleaned_lexicon_tiny.csv",
         tokenizer=tokenizer,
-        columns=['lexical_unit', 'pos', 'gloss'],
-        sep='; ',
-        strip=True,
-        lowercase=True,
+        columns=["lexical_unit", "pos", "gloss"],
     )
-    full_dict = dict_tokenizer.tokenize()
-    print(f"Loaded dictionary rows: {len(full_dict)}")
+    full_dict = lex_tokenizer.tokenize()
+    print(f"📖 Loaded dictionary with {len(full_dict)} entries")
 
-    _ = load_dictionary_consistent(CSV_PATH)  # optional check
-
-    if not os.path.exists(TRAIN_DATA_PATH):
-        raise FileNotFoundError(f"Training data file not found: {TRAIN_DATA_PATH}")
-
-    train_dataset = LexiconDataset(TRAIN_DATA_PATH, tokenizer, max_length=512)
-
-    # Config (num_layers used by RCA config; RCA stack depth in model equals Qwen decoder depth)
-    config = LexiconCompressorConfig(
-        qwen_config=qwen_model.config,
-        num_layers=2,                # kept for config compatibility
-        num_compress_tokens=5,
-        learned_tokens_prepend=False,
+    # ==== Custom Model ====
+    model = LexiconCompressorModel(
+        qwen_model=base_qwen,
+        full_dict=full_dict,
+        dict_encoder_num_compress_tokens=4,
+        dict_encoder_learned_tokens_prepend=True,
     )
+    # print("====")
+    # print(sum(p.numel() for p in model.qwen.parameters()))
 
-    model = LexiconCompressorHFModel(config=config, qwen_model=qwen_model, full_dict=full_dict)
+    # ==== Dataset ====
+    dataset = load_dataset(
+        "json",
+        data_files={"train": "data/train.json", "validation": "data/test.json"},
+    )
+    print(f"📊 Dataset loaded: train={len(dataset['train'])}, val={len(dataset['validation'])}")
 
+    # ==== Preprocess ====
+    def preprocess(example):
+        instruction = example.get("instruction", "")
+        source = example.get("source_text", "")
+        target = example.get("target_text", "")
+
+        full_text = f"{instruction}{source} -> {target}"
+        if not full_text.strip():
+            full_text = "Empty example."
+
+        enc = tokenizer(full_text, truncation=True, max_length=512, padding=False)
+        enc["labels"] = enc["input_ids"].copy()
+
+        dict_indices = example.get("dict_indices", [])
+        max_dict_size = len(full_dict)
+        enc["row_indices_per_sample"] = [i for i in dict_indices if 0 <= i < max_dict_size][:32]
+
+        return enc
+
+    tokenized = dataset.map(
+        preprocess,
+        remove_columns=dataset["train"].column_names,
+        desc="Tokenizing",
+    )
+    tokenized = tokenized.filter(lambda e: len(e["input_ids"]) > 0)
+
+    # ==== Collator & Args ====
+    data_collator = CustomDataCollator(tokenizer)
     training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=2,
-        num_train_epochs=30,
-        logging_dir="./logs",
-        logging_steps=5,
-        save_steps=50,
-        save_total_limit=2,
+        output_dir="./outputs",
+        report_to="none",
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=16,
+        learning_rate=5e-5,
+        num_train_epochs=100,
+        logging_steps=10,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        save_total_limit=10,
+        fp16=torch.cuda.is_available(),
+        dataloader_drop_last=True,
         remove_unused_columns=False,
-        fp16=torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory > 8e9,
-        dataloader_pin_memory=False,
-        dataloader_num_workers=0,
-        report_to=[],  # set to ['wandb'] if W&B is available
-        logging_first_step=True,
-        seed=42,
-        max_grad_norm=1.0,
-        learning_rate=1e-5,
-        warmup_steps=10,
-        optim="adamw_torch",
-        lr_scheduler_type="linear",
-        weight_decay=0.01,
+        # deepspeed="deepspeed/ds_config.json"
     )
 
-    trainer = LexiconCompressorTrainer(
+    # ==== Trainer ====
+    trainer = LexiconTrainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        data_collator=LexiconDataCollator(),
+        train_dataset=tokenized["train"],
+        eval_dataset=tokenized["validation"],
+        tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
-    print("Starting training...")
+    # ==== Run training ====
+    print("🚀 Starting training...")
     trainer.train()
-
-    print("Saving model...")
-    try:
-        trainer.save_model(OUTPUT_DIR)
-    except Exception as e:
-        print(f"Warning: Could not save model normally: {e}\nUsing alternative save method...")
-        save_model_safe(model, tokenizer, OUTPUT_DIR)
-
-    print("Done.")
+    trainer.save_model("./outputs/final_model")
+    print("✅ Training completed!")
 
 
 if __name__ == "__main__":
